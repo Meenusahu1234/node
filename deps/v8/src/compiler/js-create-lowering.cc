@@ -654,21 +654,22 @@ Reduction JSCreateLowering::ReduceJSCreateArray(Node* node) {
       dependencies()->DependOnInitialMapInstanceSizePrediction(
           original_constructor);
 
-  // Tells whether we are protected by either the {site} or a
-  // protector cell to do certain speculative optimizations.
-  bool can_inline_call = false;
+  // Tells whether we are protected by either the {site} or a protector cell to
+  // do certain speculative optimizations. This mechanism protects against
+  // deopt loops.
+  bool can_speculate_call = false;
 
   // Check if we have a feedback {site} on the {node}.
   ElementsKind elements_kind = initial_map->elements_kind();
   if (site_ref) {
     elements_kind = site_ref->GetElementsKind();
-    can_inline_call = site_ref->CanInlineCall();
+    can_speculate_call = !site_ref->IsSpeculationDisabled();
     allocation = dependencies()->DependOnPretenureMode(*site_ref);
     dependencies()->DependOnElementsKind(*site_ref);
   } else {
     // If there is no allocation site, only inline the constructor when there is
     // overall speculation feedback that can be disabled on a deopt.
-    can_inline_call = p.call_feedback().IsValid();
+    can_speculate_call = p.call_feedback().IsValid();
   }
 
   if (arity == 0) {
@@ -701,7 +702,7 @@ Reduction JSCreateLowering::ReduceJSCreateArray(Node* node) {
                             allocation, slack_tracking_prediction,
                             p.call_feedback());
     }
-    if (length_type.Maybe(Type::UnsignedSmall()) && can_inline_call) {
+    if (length_type.Maybe(Type::UnsignedSmall()) && can_speculate_call) {
       return ReduceNewArray(node, length, *initial_map, elements_kind,
                             allocation, slack_tracking_prediction,
                             p.call_feedback());
@@ -739,7 +740,7 @@ Reduction JSCreateLowering::ReduceJSCreateArray(Node* node) {
       elements_kind = GetMoreGeneralElementsKind(
           elements_kind, IsHoleyElementsKind(elements_kind) ? HOLEY_ELEMENTS
                                                             : PACKED_ELEMENTS);
-    } else if (!can_inline_call) {
+    } else if (!can_speculate_call) {
       // We have some crazy combination of types for the {values} where
       // there's no clear decision on the elements kind statically. And
       // we don't have a protection against deoptimization loops for the
@@ -941,9 +942,6 @@ Reduction JSCreateLowering::ReduceJSCreateClosure(Node* node) {
   CreateClosureParameters const& p = n.Parameters();
   SharedFunctionInfoRef shared = p.shared_info();
   FeedbackCellRef feedback_cell = n.GetFeedbackCellRefChecked(broker());
-#ifndef V8_ENABLE_LEAPTIERING
-  HeapObjectRef code = p.code();
-#endif
   Effect effect = n.effect();
   Control control = n.control();
   Node* context = n.context();
@@ -963,7 +961,6 @@ Reduction JSCreateLowering::ReduceJSCreateClosure(Node* node) {
   DCHECK(!function_map.IsInobjectSlackTrackingInProgress());
   DCHECK(!function_map.is_dictionary_map());
 
-#ifdef V8_ENABLE_LEAPTIERING
   // TODO(saelo): we should embed the dispatch handle directly into the
   // generated code instead of loading it at runtime from the FeedbackCell.
   // This will likely first require GC support though.
@@ -986,7 +983,6 @@ Reduction JSCreateLowering::ReduceJSCreateClosure(Node* node) {
             AccessBuilder::ForFeedbackCellDispatchHandleNoWriteBarrier()),
         feedback_cell_node, effect, control);
   }
-#endif  // V8_ENABLE_LEAPTIERING
 
   // TODO(turbofan): We should use the pretenure flag from {p} here,
   // but currently the heuristic in the parser works against us, as
@@ -1012,12 +1008,8 @@ Reduction JSCreateLowering::ReduceJSCreateClosure(Node* node) {
   a.Store(AccessBuilder::ForJSFunctionSharedFunctionInfo(), shared);
   a.Store(AccessBuilder::ForJSFunctionContext(), context);
   a.Store(AccessBuilder::ForJSFunctionFeedbackCell(), feedback_cell);
-#ifdef V8_ENABLE_LEAPTIERING
   a.Store(AccessBuilder::ForJSFunctionDispatchHandleNoWriteBarrier(),
           dispatch_handle);
-#else
-  a.Store(AccessBuilder::ForJSFunctionCode(), code);
-#endif  // V8_ENABLE_LEAPTIERING
   static_assert(JSFunction::kSizeWithoutPrototype == 7 * kTaggedSize);
   if (function_map.has_prototype_slot()) {
     a.Store(AccessBuilder::ForJSFunctionPrototypeOrInitialMap(),

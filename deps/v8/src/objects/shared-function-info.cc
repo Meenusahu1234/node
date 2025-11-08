@@ -72,12 +72,8 @@ void SharedFunctionInfo::Init(ReadOnlyRoots ro_roots, int unique_id) {
   clear_padding();
 }
 
+// LINT.IfChange(GetSharedFunctionInfoCode)
 Tagged<Code> SharedFunctionInfo::GetCode(Isolate* isolate) const {
-  // ======
-  // NOTE: This chain of checks MUST be kept in sync with the equivalent CSA
-  // GetSharedFunctionInfoCode method in code-stub-assembler.cc.
-  // ======
-
   Tagged<Object> data = GetTrustedData(isolate);
   if (data != Smi::zero()) {
     DCHECK(HasTrustedData());
@@ -150,6 +146,7 @@ Tagged<Code> SharedFunctionInfo::GetCode(Isolate* isolate) const {
 
   UNREACHABLE();
 }
+// LINT.ThenChange(/src/codegen/code-stub-assembler.cc:GetSharedFunctionInfoCode)
 
 SharedFunctionInfo::ScriptIterator::ScriptIterator(Isolate* isolate,
                                                    Tagged<Script> script)
@@ -232,16 +229,10 @@ void SharedFunctionInfo::SetScript(IsolateForSandbox isolate,
 
 void SharedFunctionInfo::CopyFrom(Tagged<SharedFunctionInfo> other,
                                   IsolateForSandbox isolate) {
-  if (other->HasTrustedData()) {
-    SetTrustedData(
-        TrustedCast<ExposedTrustedObject>(other->GetTrustedData(isolate)));
-  } else {
-    SetUntrustedData(other->GetUntrustedData());
-  }
-
   PtrComprCageBase cage_base = GetPtrComprCageBase(*this);
   set_name_or_scope_info(other->name_or_scope_info(cage_base, kAcquireLoad),
                          kReleaseStore);
+
   set_outer_scope_info_or_feedback_metadata(
       other->outer_scope_info_or_feedback_metadata(cage_base));
   set_script(other->script(cage_base, kAcquireLoad), kReleaseStore);
@@ -256,6 +247,15 @@ void SharedFunctionInfo::CopyFrom(Tagged<SharedFunctionInfo> other,
                           kRelaxedStore);
   set_unique_id(other->unique_id());
   set_age(0);
+
+  // Install code last to ensure that the entire SFI is properly initialized if
+  // it's compiled.
+  if (other->HasTrustedData()) {
+    SetTrustedData(
+        TrustedCast<ExposedTrustedObject>(other->GetTrustedData(isolate)));
+  } else {
+    SetUntrustedData(other->GetUntrustedData());
+  }
 
 #if DEBUG
   // This should now be byte-for-byte identical to the input except for the age
@@ -324,7 +324,7 @@ std::unique_ptr<char[]> SharedFunctionInfo::DebugNameCStr() const {
 #if V8_ENABLE_WEBASSEMBLY
   if (HasWasmExportedFunctionData(GetCurrentIsolateForSandbox())) {
     return WasmExportedFunction::GetDebugName(
-        wasm_exported_function_data()->sig());
+        wasm_exported_function_data()->internal()->sig());
   }
 #endif  // V8_ENABLE_WEBASSEMBLY
   DisallowGarbageCollection no_gc;

@@ -560,10 +560,16 @@ MaybeDirectHandle<String> Object::NoSideEffectsToMaybeString(
     Isolate* isolate, DirectHandle<Object> input) {
   DisallowJavascriptExecution no_js(isolate);
 
-  if (IsString(*input) || IsNumber(*input) || IsOddball(*input)) {
+  if (IsAnyHole(*input, isolate)) {
+    ReadOnlyRoots roots(isolate);
+#define HOLE_CASE(CamelName, snake_name, _) \
+  if (Is##CamelName(*input))                \
+    return isolate->factory()->NewStringFromAsciiChecked(#CamelName);
+    HOLE_LIST(HOLE_CASE)
+#undef HOLE_CASE
+    UNREACHABLE();
+  } else if (IsString(*input) || IsNumber(*input) || IsOddball(*input)) {
     return Object::ToString(isolate, input).ToHandleChecked();
-  } else if (IsTerminationException(*input)) {
-    return isolate->factory()->NewStringFromStaticChars("TerminationException");
   } else if (IsJSProxy(*input)) {
     DirectHandle<Object> currInput = input;
     do {
@@ -758,11 +764,11 @@ template <typename IsolateT>
 bool Object::BooleanValue(Tagged<Object> obj, IsolateT* isolate) {
   if (IsSmi(obj)) return Smi::ToInt(obj) != 0;
   DCHECK(IsHeapObject(obj));
+#ifdef V8_ENABLE_WEBASSEMBLY
+  DCHECK(!IsWasmNull(obj));
+#endif
   if (IsBoolean(obj)) return IsTrue(obj, isolate);
   if (IsNullOrUndefined(obj, isolate)) return false;
-#ifdef V8_ENABLE_WEBASSEMBLY
-  if (IsWasmNull(obj)) return false;
-#endif
   if (IsUndetectable(obj)) return false;  // Undetectable object is false.
   if (IsString(obj)) return Cast<String>(obj)->length() != 0;
   if (IsHeapNumber(obj)) return DoubleToBoolean(Cast<HeapNumber>(obj)->value());
@@ -1533,9 +1539,8 @@ MaybeHandle<JSAny> Object::GetPropertyWithAccessor(LookupIterator* it) {
     RETURN_EXCEPTION_IF_EXCEPTION(isolate);
     Handle<JSAny> reboxed_result(*result, isolate);
     if (info->replace_on_access() && IsJSReceiver(*receiver)) {
-      RETURN_ON_EXCEPTION(isolate,
-                          Accessors::ReplaceAccessorWithDataProperty(
-                              isolate, receiver, holder, name, result));
+      RETURN_ON_EXCEPTION(isolate, Accessors::ReplaceAccessorWithDataProperty(
+                                       isolate, holder, name, result));
     }
     return reboxed_result;
   }
@@ -2066,6 +2071,10 @@ int HeapObject::SizeFromMap(Tagged<Map> map) const {
   if (instance_type == WASM_DISPATCH_TABLE_TYPE) {
     return WasmDispatchTable::SizeFor(
         UncheckedCast<WasmDispatchTable>(*this)->capacity());
+  }
+  if (instance_type == WASM_DISPATCH_TABLE_FOR_IMPORTS_TYPE) {
+    return WasmDispatchTableForImports::SizeFor(
+        UncheckedCast<WasmDispatchTableForImports>(*this)->length());
   }
 #endif  // V8_ENABLE_WEBASSEMBLY
   if (instance_type == DOUBLE_STRING_CACHE_TYPE) {
@@ -2765,7 +2774,11 @@ Maybe<bool> Object::TransitionAndWriteDataProperty(
   it->PrepareTransitionToDataProperty(receiver, value, attributes,
                                       store_origin);
   DCHECK_EQ(LookupIterator::TRANSITION, it->state());
-  it->ApplyTransitionToDataProperty(receiver);
+
+  // Apply the transitions -- this can fail if there are too many properties.
+  Maybe<bool> transitioned =
+      it->ApplyTransitionToDataProperty(receiver, should_throw);
+  if (!transitioned.FromMaybe(false)) return transitioned;
 
   // Write the property value.
   it->WriteDataValue(value, true);
@@ -3494,8 +3507,10 @@ Maybe<bool> JSProxy::SetPrivateSymbol(Isolate* isolate,
     if (!dict.is_identical_to(result)) proxy->SetProperties(*result);
   } else {
     DirectHandle<NameDictionary> dict(proxy->property_dictionary(), isolate);
-    DirectHandle<NameDictionary> result =
-        NameDictionary::Add(isolate, dict, private_name, value, details);
+    DirectHandle<NameDictionary> result;
+    ASSIGN_RETURN_ON_EXCEPTION(
+        isolate, result,
+        NameDictionary::Add(isolate, dict, private_name, value, details));
     if (!dict.is_identical_to(result)) proxy->SetProperties(*result);
   }
   return Just(true);
@@ -3946,9 +3961,9 @@ void DescriptorArray::CopyFrom(InternalIndex index,
   Set(index, src->GetKey(index), src->GetValue(index), details);
 }
 
-void DescriptorArray::Sort() {
+void DescriptorArray::SortImpl(const int len) {
   // In-place heap sort.
-  const int len = number_of_descriptors();
+  DCHECK_EQ(len, number_of_descriptors());
   // Reset sorting since the descriptor array might contain invalid pointers.
   for (int i = 0; i < len; ++i) SetSortedKey(i, i);
   // Bottom-up max-heap construction.
@@ -4856,14 +4871,29 @@ MaybeHandle<Derived> HashTable<Derived, Shape>::TryNew(
     IsolateT* isolate, uint32_t at_least_space_for, AllocationType allocation,
     MinimumCapacity capacity_option) {
   DCHECK_LE(0, at_least_space_for);
-  DCHECK_IMPLIES(capacity_option == USE_CUSTOM_MINIMUM_CAPACITY,
-                 base::bits::IsPowerOfTwo(at_least_space_for));
 
-  uint32_t capacity = (capacity_option == USE_CUSTOM_MINIMUM_CAPACITY)
-                          ? at_least_space_for
-                          : ComputeCapacity(at_least_space_for);
-  if (capacity > HashTable::kMaxCapacity) {
-    return kNullMaybeHandle;
+  uint32_t capacity;
+  if (capacity_option == USE_CUSTOM_MINIMUM_CAPACITY) {
+    DCHECK(base::bits::IsPowerOfTwo(at_least_space_for));
+    capacity = at_least_space_for;
+    if (capacity > HashTable::kMaxCapacity) {
+      return kNullMaybeHandle;
+    }
+  } else {
+    // Max |at_least_space_for| value that's about to make the table capacity
+    // exceed the HashTable::kMaxCapacity.
+    const uint32_t kMaxAtLeastSpaceFor = HashTable::kMaxCapacity * 2 / 3;
+    static_assert(ComputeCapacity(kMaxAtLeastSpaceFor) <=
+                  HashTable::kMaxCapacity);
+    static_assert(ComputeCapacity(kMaxAtLeastSpaceFor + 1) >=
+                  HashTable::kMaxCapacity);
+    static_assert(ComputeCapacity(kMaxAtLeastSpaceFor + 4) >
+                  HashTable::kMaxCapacity);
+    if (at_least_space_for > kMaxAtLeastSpaceFor) {
+      return kNullMaybeHandle;
+    }
+    capacity = ComputeCapacity(at_least_space_for);
+    DCHECK_LE(capacity, HashTable::kMaxCapacity);
   }
   return NewInternal(isolate, capacity, allocation);
 }
@@ -5238,9 +5268,13 @@ HandleType<Derived> Dictionary<Derived, Shape>::DeleteEntry(
 template <typename Derived, typename Shape>
 template <template <typename> typename HandleType>
   requires(std::is_convertible_v<HandleType<Derived>, DirectHandle<Derived>>)
-HandleType<Derived> Dictionary<Derived, Shape>::AtPut(
-    Isolate* isolate, HandleType<Derived> dictionary, Key key,
-    DirectHandle<Object> value, PropertyDetails details) {
+auto Dictionary<Derived, Shape>::AtPut(Isolate* isolate,
+                                       HandleType<Derived> dictionary, Key key,
+                                       DirectHandle<Object> value,
+                                       PropertyDetails details) {
+  using AtPutReturnType =
+      decltype(Derived::Add(isolate, dictionary, key, value, details));
+
   InternalIndex entry = dictionary->FindEntry(isolate, key);
 
   // If the entry is present set the value;
@@ -5251,7 +5285,7 @@ HandleType<Derived> Dictionary<Derived, Shape>::AtPut(
   // We don't need to copy over the enumeration index.
   dictionary->ValueAtPut(entry, *value);
   if (TodoShape::kEntrySize == 3) dictionary->DetailsAtPut(entry, details);
-  return dictionary;
+  return AtPutReturnType(dictionary);
 }
 
 template <typename Derived, typename Shape>
@@ -5286,7 +5320,7 @@ BaseNameDictionary<Derived, Shape>::AddNoUpdateNextEnumerationIndex(
 template <typename Derived, typename Shape>
 template <template <typename> typename HandleType>
   requires(std::is_convertible_v<HandleType<Derived>, DirectHandle<Derived>>)
-HandleType<Derived> BaseNameDictionary<Derived, Shape>::Add(
+HandleType<Derived>::MaybeType BaseNameDictionary<Derived, Shape>::Add(
     Isolate* isolate, HandleType<Derived> dictionary, Key key,
     DirectHandle<Object> value, PropertyDetails details,
     InternalIndex* entry_out) {
@@ -5295,6 +5329,10 @@ HandleType<Derived> BaseNameDictionary<Derived, Shape>::Add(
   // Assign an enumeration index to the property and update
   // SetNextEnumerationIndex.
   int index = Derived::NextEnumerationIndex(isolate, dictionary);
+  if (!PropertyDetails::CanSetIndex(index)) {
+    THROW_NEW_ERROR(isolate,
+                    NewRangeError(MessageTemplate::kTooManyProperties));
+  }
   details = details.set_index(index);
   dictionary = AddNoUpdateNextEnumerationIndex(isolate, dictionary, key, value,
                                                details, entry_out);
@@ -5594,9 +5632,8 @@ int NameToIndexHashTable::IndexAt(InternalIndex entry) {
 
 template <typename Derived, typename Shape>
 Handle<Derived> ObjectHashTableBase<Derived, Shape>::Put(
-    Handle<Derived> table, DirectHandle<Object> key,
+    Isolate* isolate, Handle<Derived> table, DirectHandle<Object> key,
     DirectHandle<Object> value) {
-  Isolate* isolate = Heap::FromWritableHeapObject(*table)->isolate();
   DCHECK(table->IsKey(ReadOnlyRoots(isolate), *key));
   DCHECK(!IsTheHole(*value, ReadOnlyRoots(isolate)));
 
@@ -6324,11 +6361,11 @@ bool MapWord::IsMapOrForwarded(Tagged<Map> map) {
   BaseNameDictionary<DERIVED, SHAPE>::New(LocalIsolate*, int, AllocationType,  \
                                           MinimumCapacity);                    \
                                                                                \
-  template V8_EXPORT_PRIVATE DirectHandle<DERIVED>                             \
+  template V8_EXPORT_PRIVATE MaybeDirectHandle<DERIVED>                        \
   BaseNameDictionary<DERIVED, SHAPE>::Add(                                     \
       Isolate* isolate, DirectHandle<DERIVED>, Key, DirectHandle<Object>,      \
       PropertyDetails, InternalIndex*);                                        \
-  template V8_EXPORT_PRIVATE IndirectHandle<DERIVED>                           \
+  template V8_EXPORT_PRIVATE MaybeIndirectHandle<DERIVED>                      \
   BaseNameDictionary<DERIVED, SHAPE>::Add(                                     \
       Isolate* isolate, IndirectHandle<DERIVED>, Key, DirectHandle<Object>,    \
       PropertyDetails, InternalIndex*);                                        \

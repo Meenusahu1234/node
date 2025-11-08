@@ -92,23 +92,14 @@ void LoadTypedArrayLength::GenerateCode(MaglevAssembler* masm,
 }
 
 void CheckJSDataViewBounds::SetValueLocationConstraints() {
-  UseRegister(receiver_input());
   UseRegister(index_input());
+  UseRegister(byte_length_input());
 }
+
 void CheckJSDataViewBounds::GenerateCode(MaglevAssembler* masm,
                                          const ProcessingState& state) {
-  Register object = ToRegister(receiver_input());
   Register index = ToRegister(index_input());
-  Register byte_length = kScratchRegister;
-  if (v8_flags.debug_code) {
-    __ AssertNotSmi(object);
-    __ CmpObjectType(object, JS_DATA_VIEW_TYPE, kScratchRegister);
-    __ Assert(equal, AbortReason::kUnexpectedValue);
-  }
-
-  // Normal DataView (backed by AB / SAB) or non-length tracking backed by GSAB.
-  __ LoadBoundedSizeFromObject(byte_length, object,
-                               JSDataView::kRawByteLengthOffset);
+  Register byte_length = ToRegister(byte_length_input());
 
   int element_size = compiler::ExternalArrayElementSize(element_type_);
   if (element_size > 1) {
@@ -674,6 +665,24 @@ DEF_SHIFT_BINOP(Int32ShiftRight, sarl)
 DEF_SHIFT_BINOP(Int32ShiftRightLogical, shrl)
 #undef DEF_SHIFT_BINOP
 
+void Int32Increment::SetValueLocationConstraints() {
+  UseRegister(value_input());
+  DefineSameAsFirst(this);
+}
+void Int32Increment::GenerateCode(MaglevAssembler* masm,
+                                  const ProcessingState& state) {
+  __ incl(ToRegister(value_input()));
+}
+
+void Int32Decrement::SetValueLocationConstraints() {
+  UseRegister(value_input());
+  DefineSameAsFirst(this);
+}
+void Int32Decrement::GenerateCode(MaglevAssembler* masm,
+                                  const ProcessingState& state) {
+  __ decl(ToRegister(value_input()));
+}
+
 void Int32IncrementWithOverflow::SetValueLocationConstraints() {
   UseRegister(value_input());
   DefineSameAsFirst(this);
@@ -891,6 +900,77 @@ void Float64Exponentiate::GenerateCode(MaglevAssembler* masm,
   __ CallCFunction(ExternalReference::ieee754_pow_function(), 2);
 }
 
+namespace {
+
+template <typename LeftIsMinFunction, typename RightIsMinFunction>
+void Float64MinMaxHelper(MaglevAssembler* masm, DoubleRegister left_and_out,
+                         DoubleRegister right,
+                         LeftIsMinFunction left_is_min_code,
+                         RightIsMinFunction right_is_min_code) {
+  Label left_is_min, right_is_min, has_nan, done;
+  __ Ucomisd(left_and_out, right);
+  __ j(parity_even, &has_nan);
+  __ j(below, &left_is_min, Label::kNear);
+  __ j(above, &right_is_min, Label::kNear);
+
+  // The values are equal. We still need to handle -0 vs 0.
+  __ Movmskpd(kScratchRegister, left_and_out);
+  __ testl(kScratchRegister, Immediate(1));  // Sign bit.
+  // If left has sign bit 0, right might still have the sign bit set.
+  __ j(zero, &right_is_min, Label::kNear);
+
+  __ bind(&left_is_min);
+  left_is_min_code();
+  __ jmp(&done);
+
+  __ bind(&right_is_min);
+  right_is_min_code();
+  __ jmp(&done);
+
+  __ bind(&has_nan);
+  __ Pcmpeqd(left_and_out, left_and_out);
+
+  __ bind(&done);
+}
+
+}  // namespace
+
+void Float64Min::SetValueLocationConstraints() {
+  UseRegister(left_input());
+  UseRegister(right_input());
+  DefineSameAsFirst(this);
+}
+
+void Float64Min::GenerateCode(MaglevAssembler* masm,
+                              const ProcessingState& state) {
+  DoubleRegister left_and_out = ToDoubleRegister(left_input());
+  DoubleRegister right = ToDoubleRegister(right_input());
+  Float64MinMaxHelper(
+      masm, left_and_out, right,
+      // Left is min
+      [&]() {},
+      // Right is min
+      [&]() { __ Move(left_and_out, right); });
+}
+
+void Float64Max::SetValueLocationConstraints() {
+  UseRegister(left_input());
+  UseRegister(right_input());
+  DefineSameAsFirst(this);
+}
+
+void Float64Max::GenerateCode(MaglevAssembler* masm,
+                              const ProcessingState& state) {
+  DoubleRegister left_and_out = ToDoubleRegister(left_input());
+  DoubleRegister right = ToDoubleRegister(right_input());
+  Float64MinMaxHelper(
+      masm, left_and_out, right,
+      // Left is min
+      [&]() { __ Move(left_and_out, right); },
+      // Right is min
+      [&]() {});
+}
+
 int Float64Ieee754Unary::MaxCallStackArgs() const {
   return MaglevAssembler::ArgumentStackSlotsForCFunctionCall(1);
 }
@@ -931,26 +1011,12 @@ void Float64Sqrt::GenerateCode(MaglevAssembler* masm,
   __ Sqrtsd(result_register, value);
 }
 
-void HoleyFloat64ToMaybeNanFloat64::SetValueLocationConstraints() {
+void ChangeFloat64ToHoleyFloat64::SetValueLocationConstraints() {
   UseRegister(input());
   DefineSameAsFirst(this);
 }
-void HoleyFloat64ToMaybeNanFloat64::GenerateCode(MaglevAssembler* masm,
-                                                 const ProcessingState& state) {
-  DoubleRegister value = ToDoubleRegister(input());
-  // The hole value is a signalling NaN, so just silence it to get the float64
-  // value.
-  __ Xorpd(kScratchDoubleReg, kScratchDoubleReg);
-  __ Subsd(value, kScratchDoubleReg);
-}
-
-#ifdef V8_ENABLE_UNDEFINED_DOUBLE
-void Float64ToHoleyFloat64::SetValueLocationConstraints() {
-  UseRegister(input());
-  DefineSameAsFirst(this);
-}
-void Float64ToHoleyFloat64::GenerateCode(MaglevAssembler* masm,
-                                         const ProcessingState& state) {
+void ChangeFloat64ToHoleyFloat64::GenerateCode(MaglevAssembler* masm,
+                                               const ProcessingState& state) {
   DoubleRegister value = ToDoubleRegister(input());
   // A Float64 value could contain a NaN with the bit pattern that has a special
   // interpretation in the HoleyFloat64 representation, so we need to canicalize
@@ -959,12 +1025,46 @@ void Float64ToHoleyFloat64::GenerateCode(MaglevAssembler* masm,
   __ Subsd(value, kScratchDoubleReg);
 }
 
-void ConvertHoleNanToUndefinedNan::SetValueLocationConstraints() {
+void HoleyFloat64ToSilencedFloat64::SetValueLocationConstraints() {
   UseRegister(input());
   DefineSameAsFirst(this);
 }
-void ConvertHoleNanToUndefinedNan::GenerateCode(MaglevAssembler* masm,
-                                                const ProcessingState& state) {
+void HoleyFloat64ToSilencedFloat64::GenerateCode(MaglevAssembler* masm,
+                                                 const ProcessingState& state) {
+  DoubleRegister value = ToDoubleRegister(input());
+  // The hole value is a signalling NaN, so just silence it to get the
+  // float64 value.
+  __ Xorpd(kScratchDoubleReg, kScratchDoubleReg);
+  __ Subsd(value, kScratchDoubleReg);
+}
+
+void Float64ToSilencedFloat64::SetValueLocationConstraints() {
+  UseRegister(input());
+  DefineSameAsFirst(this);
+}
+void Float64ToSilencedFloat64::GenerateCode(MaglevAssembler* masm,
+                                            const ProcessingState& state) {
+  DoubleRegister value = ToDoubleRegister(input());
+  // The hole value is a signalling NaN, so just silence it to get the
+  // float64 value.
+  __ Xorpd(kScratchDoubleReg, kScratchDoubleReg);
+  __ Subsd(value, kScratchDoubleReg);
+}
+
+void UnsafeFloat64ToHoleyFloat64::SetValueLocationConstraints() {
+  UseRegister(input());
+  DefineSameAsFirst(this);
+}
+void UnsafeFloat64ToHoleyFloat64::GenerateCode(MaglevAssembler* masm,
+                                               const ProcessingState& state) {}
+
+#ifdef V8_ENABLE_UNDEFINED_DOUBLE
+void HoleyFloat64ConvertHoleToUndefined::SetValueLocationConstraints() {
+  UseRegister(input());
+  DefineSameAsFirst(this);
+}
+void HoleyFloat64ConvertHoleToUndefined::GenerateCode(
+    MaglevAssembler* masm, const ProcessingState& state) {
   DoubleRegister value = ToDoubleRegister(input());
   Label done;
   __ JumpIfNotHoleNan(value, kScratchRegister, &done);

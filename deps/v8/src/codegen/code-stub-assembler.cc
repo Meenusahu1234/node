@@ -2015,7 +2015,6 @@ TNode<Code> CodeStubAssembler::LoadCodePointerFromObject(
       object, field_offset, kCodeIndirectPointerTag));
 }
 
-#ifdef V8_ENABLE_LEAPTIERING
 
 TNode<UintPtrT> CodeStubAssembler::ComputeJSDispatchTableEntryOffset(
     TNode<JSDispatchHandleT> handle) {
@@ -2043,16 +2042,7 @@ TNode<Code> CodeStubAssembler::LoadCodeObjectFromJSDispatchTable(
   TNode<UintPtrT> shifted_value;
   if (JSDispatchEntry::kObjectPointerOffset == 0) {
     shifted_value =
-#if defined(__illumos__) && defined(V8_HOST_ARCH_64_BIT)
-    // Pointers in illumos span both the low 2^47 range and the high 2^47 range
-    // as well. Checking the high bit being set in illumos means all higher bits
-    // need to be set to 1 after shifting right.
-    // Use WordSar() so any high-bit check wouldn't be necessary.
-        UncheckedCast<UintPtrT>(WordSar(UncheckedCast<IntPtrT>(value),
-            IntPtrConstant(JSDispatchEntry::kObjectPointerShift)));
-#else
         WordShr(value, UintPtrConstant(JSDispatchEntry::kObjectPointerShift));
-#endif /* __illumos__ and 64-bit */
   } else {
     shifted_value = UintPtrAdd(
         WordShr(value, UintPtrConstant(JSDispatchEntry::kObjectPointerShift)),
@@ -2075,7 +2065,6 @@ TNode<Uint16T> CodeStubAssembler::LoadParameterCountFromJSDispatchTable(
   return Load<Uint16T>(table, offset);
 }
 
-#endif  // V8_ENABLE_LEAPTIERING
 
 void CodeStubAssembler::TailCallJSCode(
     TNode<Code> code, TNode<Context> context, TNode<JSFunction> function,
@@ -2099,12 +2088,7 @@ void CodeStubAssembler::TailCallJSCode(
     TNode<Context> context, TNode<JSFunction> function,
     TNode<Object> new_target, TNode<Int32T> arg_count,
     TNode<JSDispatchHandleT> dispatch_handle) {
-#ifdef V8_ENABLE_LEAPTIERING
   TNode<Code> code = LoadCodeObjectFromJSDispatchTable(dispatch_handle);
-#else
-  TNode<Code> code =
-      LoadCodePointerFromObject(function, JSFunction::kCodeOffset);
-#endif  // V8_ENABLE_LEAPTIERING
 
   CodeAssembler::TailCallJSCode(code, context, function, new_target, arg_count,
                                 dispatch_handle);
@@ -2215,15 +2199,8 @@ TNode<RawPtrT> CodeStubAssembler::LoadCodePointerTableBase() {
 void CodeStubAssembler::SetSupportsDynamicParameterCount(
     TNode<JSFunction> callee, TNode<JSDispatchHandleT> dispatch_handle) {
   TNode<Uint16T> dynamic_parameter_count;
-#ifdef V8_ENABLE_LEAPTIERING
   dynamic_parameter_count =
       LoadParameterCountFromJSDispatchTable(dispatch_handle);
-#else
-  // TODO(olivf): Remove once leaptiering is supported everywhere.
-  TNode<SharedFunctionInfo> shared = LoadJSFunctionSharedFunctionInfo(callee);
-  dynamic_parameter_count =
-      LoadSharedFunctionInfoFormalParameterCountWithReceiver(shared);
-#endif
   SetDynamicJSParameterCount(dynamic_parameter_count);
 }
 
@@ -2690,11 +2667,10 @@ TNode<Uint32T> CodeStubAssembler::LoadNameHashAssumeComputed(TNode<Name> name) {
 
 TNode<Uint32T> CodeStubAssembler::LoadNameHash(TNode<Name> name,
                                                Label* if_hash_not_computed) {
+  DCHECK_NOT_NULL(if_hash_not_computed);
   TNode<Uint32T> raw_hash_field = LoadNameRawHashField(name);
-  if (if_hash_not_computed != nullptr) {
-    GotoIf(IsSetWord32(raw_hash_field, Name::kHashNotComputedMask),
-           if_hash_not_computed);
-  }
+  GotoIf(IsSetWord32(raw_hash_field, Name::kHashNotComputedMask),
+         if_hash_not_computed);
   return DecodeWord32<Name::HashBits>(raw_hash_field);
 }
 
@@ -7950,6 +7926,7 @@ TNode<BoolT> CodeStubAssembler::IsPromiseSpeciesProtectorCellInvalid() {
   return TaggedEqual(cell_value, invalid);
 }
 
+// TODO(petamoriken): delete this unused function
 TNode<BoolT>
 CodeStubAssembler::IsNumberStringNotRegexpLikeProtectorCellInvalid() {
   TNode<Smi> invalid = SmiConstant(Protectors::kProtectorInvalid);
@@ -11672,7 +11649,8 @@ void CodeStubAssembler::ForEachEnumerableOwnProperty(
 
               var_value = CallGetterIfAccessor(
                   value_or_accessor, object, var_details.value(), context,
-                  object, next_key, &slow_load, kCallJSGetterUseCachedName);
+                  object, kExpectingJSReceiver, next_key, &slow_load,
+                  kCallJSGetterUseCachedName);
               Goto(&value_ready);
 
               BIND(&slow_load);
@@ -11852,10 +11830,10 @@ void CodeStubAssembler::Lookup(TNode<Name> unique_name, TNode<Array> array,
   }
   GotoIf(Word32Equal(number_of_valid_entries, Int32Constant(0)), if_not_found);
   Label linear_search(this), binary_search(this);
-  const int kMaxElementsForLinearSearch = 32;
-  Branch(Uint32LessThanOrEqual(number_of_valid_entries,
-                               Int32Constant(kMaxElementsForLinearSearch)),
-         &linear_search, &binary_search);
+  Branch(
+      Uint32LessThanOrEqual(number_of_valid_entries,
+                            Int32Constant(Array::kMaxElementsForLinearSearch)),
+      &linear_search, &binary_search);
   BIND(&linear_search);
   {
     LookupLinear<Array>(unique_name, array, number_of_valid_entries, if_found,
@@ -12168,15 +12146,11 @@ template void CodeStubAssembler::LoadPropertyFromDictionary(
     TNode<SwissNameDictionary> dictionary, TNode<IntPtrT> name_index,
     TVariable<Uint32T>* var_details, TVariable<Object>* var_value);
 
-// |value| is the property backing store's contents, which is either a value or
-// an accessor pair, as specified by |details|. |holder| is a JSReceiver or a
-// PropertyCell. Returns either the original value, or the result of the getter
-// call.
 TNode<Object> CodeStubAssembler::CallGetterIfAccessor(
-    TNode<Object> value, TNode<Union<JSReceiver, PropertyCell>> holder,
+    TNode<Object> value, std::optional<TNode<JSReceiver>> holder,
     TNode<Uint32T> details, TNode<Context> context, TNode<JSAny> receiver,
-    TNode<Object> name, Label* if_bailout, GetOwnPropertyMode mode,
-    ExpectedReceiverMode expected_receiver_mode) {
+    ExpectedReceiverMode expected_receiver_mode, TNode<Object> name,
+    Label* if_bailout, GetOwnPropertyMode mode) {
   TVARIABLE(Object, var_value, value);
   Label done(this), if_accessor_info(this, Label::kDeferred);
 
@@ -12217,44 +12191,51 @@ TNode<Object> CodeStubAssembler::CallGetterIfAccessor(
 
       BIND(&if_function_template_info);
       {
-        Label use_cached_property(this);
-        TNode<HeapObject> cached_property_name = LoadObjectField<HeapObject>(
-            getter, FunctionTemplateInfo::kCachedPropertyNameOffset);
+        if (holder.has_value()) {
+          Label use_cached_property(this);
+          TNode<HeapObject> cached_property_name = LoadObjectField<HeapObject>(
+              getter, FunctionTemplateInfo::kCachedPropertyNameOffset);
 
-        Label* has_cached_property = mode == kCallJSGetterUseCachedName
-                                         ? &use_cached_property
-                                         : if_bailout;
-        GotoIfNot(IsTheHole(cached_property_name), has_cached_property);
+          Label* has_cached_property = mode == kCallJSGetterUseCachedName
+                                           ? &use_cached_property
+                                           : if_bailout;
+          GotoIfNot(IsTheHole(cached_property_name), has_cached_property);
 
-        TNode<JSReceiver> js_receiver;
-        switch (expected_receiver_mode) {
-          case kExpectingJSReceiver:
-            js_receiver = CAST(receiver);
-            break;
-          case kExpectingAnyReceiver:
-            // TODO(ishell): in case the function template info has a signature
-            // and receiver is not a JSReceiver the signature check in
-            // CallFunctionTemplate builtin will fail anyway, so we can short
-            // cut it here and throw kIllegalInvocation immediately.
-            js_receiver = ToObject_Inline(context, receiver);
-            break;
-        }
-        TNode<JSReceiver> holder_receiver = CAST(holder);
-        TNode<NativeContext> creation_context =
-            GetCreationContext(holder_receiver, if_bailout);
-        TNode<Context> caller_context = context;
-        var_value = CallBuiltin(
-            Builtin::kCallFunctionTemplate_Generic, creation_context, getter,
-            Int32Constant(i::JSParameterCount(0)), caller_context, js_receiver);
-        Goto(&done);
-
-        if (mode == kCallJSGetterUseCachedName) {
-          Bind(&use_cached_property);
-
-          var_value =
-              GetProperty(context, holder_receiver, cached_property_name);
-
+          TNode<JSReceiver> js_receiver;
+          switch (expected_receiver_mode) {
+            case kExpectingJSReceiver:
+              js_receiver = CAST(receiver);
+              break;
+            case kExpectingAnyReceiver:
+              // TODO(ishell): in case the function template info has a
+              // signature and receiver is not a JSReceiver the signature check
+              // in CallFunctionTemplate builtin will fail anyway, so we can
+              // short cut it here and throw kIllegalInvocation immediately.
+              js_receiver = ToObject_Inline(context, receiver);
+              break;
+          }
+          TNode<JSReceiver> holder_receiver = *holder;
+          TNode<NativeContext> creation_context =
+              GetCreationContext(holder_receiver, if_bailout);
+          TNode<Context> caller_context = context;
+          var_value = CallBuiltin(Builtin::kCallFunctionTemplate_Generic,
+                                  creation_context, getter,
+                                  Int32Constant(i::JSParameterCount(0)),
+                                  caller_context, js_receiver);
           Goto(&done);
+
+          if (mode == kCallJSGetterUseCachedName) {
+            Bind(&use_cached_property);
+
+            var_value =
+                GetProperty(context, holder_receiver, cached_property_name);
+
+            Goto(&done);
+          }
+        } else {
+          // |holder| must be available in order to handle lazy AccessorPair
+          // case (we need it for computing the function's context).
+          Unreachable();
         }
       }
     } else {
@@ -12266,56 +12247,61 @@ TNode<Object> CodeStubAssembler::CallGetterIfAccessor(
   // AccessorInfo case.
   BIND(&if_accessor_info);
   {
-    TNode<AccessorInfo> accessor_info = CAST(value);
-    Label if_array(this), if_function(this), if_wrapper(this);
+    if (holder.has_value()) {
+      TNode<AccessorInfo> accessor_info = CAST(value);
+      Label if_array(this), if_function(this), if_wrapper(this);
+      // Dispatch based on {holder} instance type.
+      TNode<Map> holder_map = LoadMap(*holder);
+      TNode<Uint16T> holder_instance_type = LoadMapInstanceType(holder_map);
+      GotoIf(IsJSArrayInstanceType(holder_instance_type), &if_array);
+      GotoIf(IsJSFunctionInstanceType(holder_instance_type), &if_function);
+      Branch(IsJSPrimitiveWrapperInstanceType(holder_instance_type),
+             &if_wrapper, if_bailout);
 
-    // Dispatch based on {holder} instance type.
-    TNode<Map> holder_map = LoadMap(holder);
-    TNode<Uint16T> holder_instance_type = LoadMapInstanceType(holder_map);
-    GotoIf(IsJSArrayInstanceType(holder_instance_type), &if_array);
-    GotoIf(IsJSFunctionInstanceType(holder_instance_type), &if_function);
-    Branch(IsJSPrimitiveWrapperInstanceType(holder_instance_type), &if_wrapper,
-           if_bailout);
+      // JSArray AccessorInfo case.
+      BIND(&if_array);
+      {
+        // We only deal with the "length" accessor on JSArray.
+        GotoIfNot(IsLengthString(LoadObjectField(accessor_info,
+                                                 AccessorInfo::kNameOffset)),
+                  if_bailout);
+        TNode<JSArray> array = CAST(*holder);
+        var_value = LoadJSArrayLength(array);
+        Goto(&done);
+      }
 
-    // JSArray AccessorInfo case.
-    BIND(&if_array);
-    {
-      // We only deal with the "length" accessor on JSArray.
-      GotoIfNot(IsLengthString(
-                    LoadObjectField(accessor_info, AccessorInfo::kNameOffset)),
-                if_bailout);
-      TNode<JSArray> array = CAST(holder);
-      var_value = LoadJSArrayLength(array);
-      Goto(&done);
-    }
+      // JSFunction AccessorInfo case.
+      BIND(&if_function);
+      {
+        // We only deal with the "prototype" accessor on JSFunction here.
+        GotoIfNot(IsPrototypeString(LoadObjectField(accessor_info,
+                                                    AccessorInfo::kNameOffset)),
+                  if_bailout);
 
-    // JSFunction AccessorInfo case.
-    BIND(&if_function);
-    {
-      // We only deal with the "prototype" accessor on JSFunction here.
-      GotoIfNot(IsPrototypeString(
-                    LoadObjectField(accessor_info, AccessorInfo::kNameOffset)),
-                if_bailout);
+        TNode<JSFunction> function = CAST(*holder);
+        GotoIfPrototypeRequiresRuntimeLookup(function, holder_map, if_bailout);
+        var_value = LoadJSFunctionPrototype(function, if_bailout);
+        Goto(&done);
+      }
 
-      TNode<JSFunction> function = CAST(holder);
-      GotoIfPrototypeRequiresRuntimeLookup(function, holder_map, if_bailout);
-      var_value = LoadJSFunctionPrototype(function, if_bailout);
-      Goto(&done);
-    }
-
-    // JSPrimitiveWrapper AccessorInfo case.
-    BIND(&if_wrapper);
-    {
-      // We only deal with the "length" accessor on JSPrimitiveWrapper string
-      // wrappers.
-      GotoIfNot(IsLengthString(
-                    LoadObjectField(accessor_info, AccessorInfo::kNameOffset)),
-                if_bailout);
-      TNode<Object> holder_value = LoadJSPrimitiveWrapperValue(CAST(holder));
-      GotoIfNot(TaggedIsNotSmi(holder_value), if_bailout);
-      GotoIfNot(IsString(CAST(holder_value)), if_bailout);
-      var_value = LoadStringLengthAsSmi(CAST(holder_value));
-      Goto(&done);
+      // JSPrimitiveWrapper AccessorInfo case.
+      BIND(&if_wrapper);
+      {
+        // We only deal with the "length" accessor on JSPrimitiveWrapper string
+        // wrappers.
+        GotoIfNot(IsLengthString(LoadObjectField(accessor_info,
+                                                 AccessorInfo::kNameOffset)),
+                  if_bailout);
+        TNode<Object> holder_value = LoadJSPrimitiveWrapperValue(CAST(*holder));
+        GotoIfNot(TaggedIsNotSmi(holder_value), if_bailout);
+        GotoIfNot(IsString(CAST(holder_value)), if_bailout);
+        var_value = LoadStringLengthAsSmi(CAST(holder_value));
+        Goto(&done);
+      }
+    } else {
+      // |holder| must be available in order to handle AccessorInfo case (we
+      // need to pass it to the callback).
+      Unreachable();
     }
   }
 
@@ -12400,7 +12386,7 @@ void CodeStubAssembler::TryGetOwnProperty(
     }
     TNode<Object> value = CallGetterIfAccessor(
         var_value->value(), object, var_details->value(), context, receiver,
-        unique_name, if_bailout, mode, expected_receiver_mode);
+        expected_receiver_mode, unique_name, if_bailout, mode);
     *var_value = value;
     Goto(if_found_value);
   }
@@ -17394,7 +17380,9 @@ TNode<Object> CodeStubAssembler::GetResultValueForHole(TNode<Object> value) {
 std::pair<TNode<Object>, TNode<Object>> CodeStubAssembler::CallIteratorNext(
     TNode<Object> iterator, TNode<Object> next_method, TNode<Context> context) {
   Label callable(this), not_callable(this, Label::kDeferred);
-  Branch(IsCallable(CAST(next_method)), &callable, &not_callable);
+  GotoIf(TaggedIsSmi(next_method), &not_callable);
+  Branch(IsCallable(UncheckedCast<HeapObject>(next_method)), &callable,
+         &not_callable);
   BIND(&not_callable);
   {
     CallRuntime(Runtime::kThrowCalledNonCallable, context, next_method);
@@ -17439,6 +17427,9 @@ ForOfNextResult CodeStubAssembler::ForOfNextHelper(TNode<Context> context,
   TNode<BoolT> is_array_iterator = IsJSArrayIterator(CAST(object));
   GotoIfNot(is_array_iterator, &slow_path);
 
+  // Check that the array iterator prototype chain is intact.
+  GotoIf(IsArrayIteratorProtectorCellInvalid(), &slow_path);
+
   // Fast path for JSArrayIterator.
   {
     TNode<JSArrayIterator> array_iterator = CAST(object);
@@ -17454,6 +17445,8 @@ ForOfNextResult CodeStubAssembler::ForOfNextHelper(TNode<Context> context,
     TNode<Smi> length = LoadFastJSArrayLength(iterated_array);
     TNode<Number> current_index = LoadObjectField<Number>(
         array_iterator, JSArrayIterator::kNextIndexOffset);
+    GotoIf(TaggedIsNotSmi(current_index), &reach_end);
+
     TNode<Smi> smi_index = CAST(current_index);
     GotoIf(SmiGreaterThanOrEqual(smi_index, length), &reach_end);
 
@@ -18180,7 +18173,8 @@ TNode<BoolT> CodeStubAssembler::NeedsAnyPromiseHooks(TNode<Uint32T> flags) {
 }
 
 TNode<Code> CodeStubAssembler::LoadBuiltin(TNode<Smi> builtin_id) {
-  CSA_DCHECK(this, SmiBelow(builtin_id, SmiConstant(Builtins::kBuiltinCount)));
+  CSA_SBXCHECK(this,
+               SmiBelow(builtin_id, SmiConstant(Builtins::kBuiltinCount)));
 
   TNode<IntPtrT> offset =
       ElementOffsetFromIndex(SmiToBInt(builtin_id), SYSTEM_POINTER_ELEMENTS);
@@ -18190,7 +18184,6 @@ TNode<Code> CodeStubAssembler::LoadBuiltin(TNode<Smi> builtin_id) {
   return CAST(BitcastWordToTagged(Load<RawPtrT>(table, offset)));
 }
 
-#ifdef V8_ENABLE_LEAPTIERING
 
 TNode<JSDispatchHandleT> CodeStubAssembler::LoadBuiltinDispatchHandle(
     RootIndex idx) {
@@ -18215,7 +18208,6 @@ TNode<JSDispatchHandleT> CodeStubAssembler::LoadBuiltinDispatchHandle(
 }
 #endif  // V8_STATIC_DISPATCH_HANDLES_BOOL
 
-#endif  // V8_ENABLE_LEAPTIERING
 
 void CodeStubAssembler::DispatchOnInstanceType(
     TNode<Object> value, TVariable<Uint16T>* type_out, Label* if_default,
@@ -18250,6 +18242,7 @@ void CodeStubAssembler::LoadSharedFunctionInfoTrustedDataAndDispatch(
 #endif
 }
 
+// LINT.IfChange(GetSharedFunctionInfoCode)
 TNode<Code> CodeStubAssembler::GetSharedFunctionInfoCode(
     TNode<SharedFunctionInfo> shared_info, TVariable<Uint16T>* data_type_out,
     Label* if_compile_lazy) {
@@ -18396,6 +18389,7 @@ TNode<Code> CodeStubAssembler::GetSharedFunctionInfoCode(
   BIND(&done);
   return sfi_code.value();
 }
+// LINT.ThenChange(/src/objects/shared-function-info.cc:GetSharedFunctionInfoCode)
 
 TNode<RawPtrT> CodeStubAssembler::LoadCodeInstructionStart(
     TNode<Code> code, CodeEntrypointTag tag) {
@@ -18446,7 +18440,6 @@ TNode<JSFunction> CodeStubAssembler::AllocateRootFunctionWithContext(
   // builtin id, so there's no need to use
   // CodeStubAssembler::GetSharedFunctionInfoCode().
   DCHECK(sfi->HasBuiltinId());
-#ifdef V8_ENABLE_LEAPTIERING
   const TNode<JSDispatchHandleT> dispatch_handle =
       LoadBuiltinDispatchHandle(function);
   CSA_DCHECK(this,
@@ -18455,10 +18448,6 @@ TNode<JSFunction> CodeStubAssembler::AllocateRootFunctionWithContext(
   StoreObjectFieldNoWriteBarrier(fun, JSFunction::kDispatchHandleOffset,
                                  dispatch_handle);
   USE(sfi);
-#else
-  const TNode<Code> code = LoadBuiltin(SmiConstant(sfi->builtin_id()));
-  StoreCodePointerFieldNoWriteBarrier(fun, JSFunction::kCodeOffset, code);
-#endif  // V8_ENABLE_LEAPTIERING
 
   return CAST(fun);
 }

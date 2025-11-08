@@ -77,9 +77,6 @@ declare_args() {
   # Sets the number of internal fields on array buffer view objects.
   v8_array_buffer_view_internal_field_count = 0
 
-  # Sets -DENABLE_GDB_JIT_INTERFACE.
-  v8_enable_gdbjit = ""
-
   # Sets -DENABLE_VTUNE_JIT_INTERFACE.
   v8_enable_vtunejit = false
 
@@ -280,9 +277,11 @@ declare_args() {
   # Controls the threshold for on-heap/off-heap Typed Arrays.
   v8_typed_array_max_size_in_heap = 64
 
-  v8_enable_gdbjit = ((v8_current_cpu == "x86" || v8_current_cpu == "x64") &&
-                      (is_linux || is_chromeos || is_mac)) ||
-                     (v8_current_cpu == "ppc64" && (is_linux || is_chromeos))
+  # Sets -DENABLE_GDB_JIT_INTERFACE.
+  v8_enable_gdbjit =
+      is_debug && (((v8_current_cpu == "x86" || v8_current_cpu == "x64") &&
+                    (is_linux || is_chromeos || is_mac)) ||
+                   (v8_current_cpu == "ppc64" && (is_linux || is_chromeos)))
 
   # Check that each header can be included in isolation (requires also
   # setting the "check_v8_header_includes" gclient variable to run a
@@ -490,18 +489,22 @@ declare_args() {
 
   # Use a hard-coded secret value when hashing.
   v8_use_default_hasher_secret = true
+
+  # add instrumentation for Dumpling differential fuzzing
+  v8_dumpling = false
 }
 
 # Derived defaults.
 if (cppgc_enable_verify_heap == "") {
-  cppgc_enable_verify_heap = v8_enable_debugging_features || v8_dcheck_always_on
+  cppgc_enable_verify_heap =
+      v8_enable_verification_features || v8_dcheck_always_on
 }
 if (v8_enable_verify_heap == "") {
-  v8_enable_verify_heap = v8_enable_debugging_features
+  v8_enable_verify_heap = v8_enable_verification_features
 }
 if (v8_enable_verify_write_barriers == "") {
   v8_enable_verify_write_barriers =
-      (v8_enable_debugging_features || v8_dcheck_always_on) &&
+      (v8_enable_verification_features || v8_dcheck_always_on) &&
       !v8_disable_write_barriers
 }
 if (v8_enable_object_print == "") {
@@ -517,18 +520,19 @@ if (v8_enable_trace_maps == "") {
   v8_enable_trace_maps = v8_enable_debugging_features
 }
 if (v8_enable_test_features == "") {
-  v8_enable_test_features = v8_enable_debugging_features || v8_dcheck_always_on
+  v8_enable_test_features =
+      v8_enable_verification_features || v8_dcheck_always_on
 }
 if (v8_enable_v8_checks == "") {
-  v8_enable_v8_checks = v8_enable_debugging_features
+  v8_enable_v8_checks = v8_enable_verification_features
 }
 if (v8_enable_memory_accounting_checks == "") {
   v8_enable_memory_accounting_checks =
-      v8_enable_debugging_features || v8_dcheck_always_on
+      v8_enable_verification_features || v8_dcheck_always_on
 }
 if (v8_enable_heap_snapshot_verify == "") {
   v8_enable_heap_snapshot_verify =
-      v8_enable_debugging_features || v8_dcheck_always_on
+      v8_enable_verification_features || v8_dcheck_always_on
 }
 if (v8_enable_snapshot_code_comments) {
   assert(v8_code_comments == true || v8_code_comments == "",
@@ -538,7 +542,7 @@ if (v8_enable_snapshot_code_comments) {
   v8_code_comments = v8_enable_debugging_features
 }
 if (v8_enable_debug_code == "") {
-  v8_enable_debug_code = v8_enable_debugging_features || v8_dcheck_always_on
+  v8_enable_debug_code = v8_enable_verification_features || v8_dcheck_always_on
 }
 if (v8_enable_snapshot_native_code_counters == "") {
   v8_enable_snapshot_native_code_counters = v8_enable_debugging_features
@@ -651,9 +655,9 @@ assert(!v8_enable_trace_ignition || v8_enable_trace_unoptimized,
 assert(!v8_enable_trace_baseline_exec || v8_enable_trace_unoptimized,
        "Baseline tracing requires unoptimized tracing to be enabled.")
 assert(
-    v8_enable_debugging_features == true || v8_dcheck_always_on ||
+    v8_enable_verification_features == true || v8_dcheck_always_on ||
         !v8_enable_slow_dchecks,
-    "v8_enable_slow_dchecks requires v8_enable_debugging_features or dcheck_always_on.")
+    "v8_enable_slow_dchecks requires v8_enable_verification_features or dcheck_always_on.")
 
 if (v8_enable_short_builtin_calls &&
     (!v8_enable_pointer_compression && v8_current_cpu != "x64")) {
@@ -825,7 +829,7 @@ assert(
 v8_random_seed = "314159265"
 v8_toolset_for_shell = "host"
 
-is_DEBUG_defined = v8_enable_debugging_features || v8_dcheck_always_on
+is_DEBUG_defined = v8_enable_verification_features || v8_dcheck_always_on
 
 ###############################################################################
 # Configurations
@@ -977,6 +981,7 @@ external_v8_defines = [
   "V8_DEPRECATION_WARNINGS",
   "V8_IMMINENT_DEPRECATION_WARNINGS",
   "V8_USE_PERFETTO",
+  "V8_USE_PERFETTO_SDK",
   "V8_MAP_PACKING",
   "V8_IS_TSAN",
   "V8_ENABLE_DIRECT_HANDLE",
@@ -1024,6 +1029,9 @@ if (v8_imminent_deprecation_warnings) {
 }
 if (v8_use_perfetto) {
   enabled_external_v8_defines += [ "V8_USE_PERFETTO" ]
+}
+if (v8_use_perfetto_sdk) {
+  enabled_external_v8_defines += [ "V8_USE_PERFETTO_SDK" ]
 }
 if (v8_enable_map_packing) {
   enabled_external_v8_defines += [ "V8_MAP_PACKING" ]
@@ -1264,7 +1272,7 @@ config("features") {
   }
   if (v8_enable_debug_code) {
     defines += [ "V8_ENABLE_DEBUG_CODE" ]
-    if (v8_enable_debugging_features) {
+    if (v8_enable_verification_features) {
       defines += [ "V8_ENABLE_SLOW_DEBUG_CODE_BY_DEFAULT" ]
     }
   }
@@ -1324,6 +1332,9 @@ config("features") {
   }
   if (v8_fuzzilli) {
     defines += [ "V8_FUZZILLI" ]
+  }
+  if (v8_dumpling) {
+    defines += [ "V8_DUMPLING" ]
   }
   if (v8_enable_fuzztest) {
     defines += [ "V8_ENABLE_FUZZTEST" ]
@@ -1646,7 +1657,7 @@ config("toolchain") {
   # TODO(infra): Support v8_enable_prof on Windows.
   # TODO(infra): Add support for compiling with simulators.
 
-  if (v8_enable_debugging_features || v8_dcheck_always_on) {
+  if (v8_enable_verification_features || v8_dcheck_always_on) {
     defines += [ "DEBUG" ]
     if (v8_enable_slow_dchecks) {
       defines += [ "ENABLE_SLOW_DCHECKS" ]
@@ -2696,7 +2707,7 @@ template("run_mksnapshot") {
         args += [ "--no-turbo-rewrite-far-jumps" ]
       }
 
-      if (v8_enable_debugging_features && v8_enable_slow_dchecks) {
+      if (v8_enable_verification_features && v8_enable_slow_dchecks) {
         # mksnapshot only accepts this flag if ENABLE_SLOW_DCHECKS is defined.
         args += [ "--no-enable-slow-asserts" ]
       }
@@ -2830,7 +2841,7 @@ if (v8_verify_builtins_compatibility) {
 action("v8_dump_build_config") {
   script = "tools/testrunner/utils/dump_build_config.py"
   outputs = [ "$root_out_dir/v8_build_config.json" ]
-  is_full_debug = v8_enable_debugging_features && !v8_optimized_debug
+  is_full_debug = v8_enable_verification_features && !v8_optimized_debug
 
   arch = v8_target_cpu
   if (v8_target_cpu == "x86") {
@@ -2915,6 +2926,7 @@ action("v8_dump_build_config") {
     "v8_cfi=$v8_control_flow_integrity",
     "v8_current_cpu=\"$v8_current_cpu\"",
     "v8_target_cpu=\"$v8_target_cpu\"",
+    "verification_features=$v8_enable_verification_features",
     "verify_csa=$v8_enable_verify_csa",
     "verify_heap=$v8_enable_verify_heap",
     "verify_predictable=$v8_enable_verify_predictable",
@@ -3553,7 +3565,7 @@ v8_header_set("v8_internal_headers") {
     "src/compiler/backend/register-allocator.h",
     "src/compiler/backend/spill-placer.h",
     "src/compiler/backend/unwinding-info-writer.h",
-    "src/compiler/basic-block-instrumentor.h",
+    "src/compiler/basic-block-call-graph-profiler.h",
     "src/compiler/branch-elimination.h",
     "src/compiler/bytecode-analysis.h",
     "src/compiler/bytecode-graph-builder.h",
@@ -3663,6 +3675,7 @@ v8_header_set("v8_internal_headers") {
     "src/compiler/turboshaft/branch-elimination-reducer.h",
     "src/compiler/turboshaft/build-graph-phase.h",
     "src/compiler/turboshaft/builtin-call-descriptors.h",
+    "src/compiler/turboshaft/call-descriptors-util.h",
     "src/compiler/turboshaft/code-elimination-and-simplification-phase.h",
     "src/compiler/turboshaft/copying-phase.h",
     "src/compiler/turboshaft/csa-branch-elimination-phase.h",
@@ -3730,6 +3743,7 @@ v8_header_set("v8_internal_headers") {
     "src/compiler/turboshaft/string-view.h",
     "src/compiler/turboshaft/tracing.h",
     "src/compiler/turboshaft/turbolev-early-lowering-reducer-inl.h",
+    "src/compiler/turboshaft/turbolev-frontend-pipeline.h",
     "src/compiler/turboshaft/turbolev-graph-builder.h",
     "src/compiler/turboshaft/type-assertions-phase.h",
     "src/compiler/turboshaft/type-inference-analysis.h",
@@ -3739,6 +3753,7 @@ v8_header_set("v8_internal_headers") {
     "src/compiler/turboshaft/typed-optimizations-reducer.h",
     "src/compiler/turboshaft/typer.h",
     "src/compiler/turboshaft/types.h",
+    "src/compiler/turboshaft/typeswitch.h",
     "src/compiler/turboshaft/undef-assembler-macros.inc",
     "src/compiler/turboshaft/uniform-reducer-adapter.h",
     "src/compiler/turboshaft/use-map.h",
@@ -4471,6 +4486,7 @@ v8_header_set("v8_internal_headers") {
       "src/tracing/code-data-source.h",
       "src/tracing/code-trace-context.h",
       "src/tracing/perfetto-logger.h",
+      "src/tracing/perfetto-sdk.h",
       "src/tracing/perfetto-utils.h",
     ]
   }
@@ -4562,7 +4578,6 @@ v8_header_set("v8_internal_headers") {
       "src/compiler/turboshaft/wasm-shuffle-reducer.h",
       "src/compiler/turboshaft/wasm-simd-phase.h",
       "src/compiler/turboshaft/wasm-turboshaft-compiler.h",
-      "src/compiler/turboshaft/wasm-type-cast-rtt-optimization-helpers.h",
       "src/compiler/wasm-address-reassociation.h",
       "src/compiler/wasm-call-descriptors.h",
       "src/compiler/wasm-compiler-definitions.h",
@@ -5134,7 +5149,7 @@ v8_compiler_sources = [
   "src/compiler/backend/register-allocator-verifier.cc",
   "src/compiler/backend/register-allocator.cc",
   "src/compiler/backend/spill-placer.cc",
-  "src/compiler/basic-block-instrumentor.cc",
+  "src/compiler/basic-block-call-graph-profiler.cc",
   "src/compiler/branch-elimination.cc",
   "src/compiler/bytecode-analysis.cc",
   "src/compiler/bytecode-graph-builder.cc",
@@ -5259,6 +5274,7 @@ v8_compiler_sources = [
   "src/compiler/turboshaft/simplify-tf-loops.cc",
   "src/compiler/turboshaft/store-store-elimination-phase.cc",
   "src/compiler/turboshaft/string-escape-analysis-reducer.cc",
+  "src/compiler/turboshaft/turbolev-frontend-pipeline.cc",
   "src/compiler/turboshaft/turbolev-graph-builder.cc",
   "src/compiler/turboshaft/type-assertions-phase.cc",
   "src/compiler/turboshaft/type-parser.cc",
@@ -5385,7 +5401,6 @@ if (v8_enable_webassembly) {
     "src/compiler/turboshaft/wasm-shuffle-reducer.cc",
     "src/compiler/turboshaft/wasm-simd-phase.cc",
     "src/compiler/turboshaft/wasm-turboshaft-compiler.cc",
-    "src/compiler/turboshaft/wasm-type-cast-rtt-optimization-helpers.cc",
     "src/compiler/wasm-address-reassociation.cc",
     "src/compiler/wasm-call-descriptors.cc",
     "src/compiler/wasm-compiler.cc",
@@ -6489,6 +6504,15 @@ v8_source_set("v8_base_without_compiler") {
     ]
   }
 
+  if (v8_dumpling) {
+    sources += [
+      "src/dumpling/dumpling-manager.cc",
+      "src/dumpling/dumpling-manager.h",
+      "src/dumpling/object-dumping.cc",
+      "src/dumpling/object-dumping.h",
+    ]
+  }
+
   if (v8_enable_i18n_support) {
     deps += [ ":run_gen-regexp-special-case" ]
     sources += [ "$target_gen_dir/src/regexp/special-case.cc" ]
@@ -7427,6 +7451,7 @@ v8_source_set("cppgc_base") {
 
   if (v8_use_perfetto) {
     sources += [
+      "src/tracing/perfetto-sdk.h",
       "src/tracing/trace-categories.cc",
       "src/tracing/trace-categories.h",
     ]

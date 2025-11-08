@@ -61,11 +61,9 @@ void PrintDouble(std::ostream& os, double val) {
     // 9007199254740991.0 instead of 9.0072e+15
     int64_t i = static_cast<int64_t>(val);
     os << i << ".0";
-#ifdef V8_ENABLE_UNDEFINED_DOUBLE
   } else if (std::isnan(val)) {
     os << val << " (0x" << std::hex << base::double_to_uint64(val) << std::dec
        << ")";
-#endif  // V8_ENABLE_UNDEFINED_DOUBLE
   } else {
     os << val;
   }
@@ -344,6 +342,10 @@ void HeapObject::HeapObjectPrint(std::ostream& os) {
     case WASM_DISPATCH_TABLE_TYPE:
       TrustedCast<WasmDispatchTable>(*this)->WasmDispatchTablePrint(os);
       break;
+    case WASM_DISPATCH_TABLE_FOR_IMPORTS_TYPE:
+      TrustedCast<WasmDispatchTableForImports>(*this)
+          ->WasmDispatchTableForImportsPrint(os);
+      break;
     case WASM_VALUE_OBJECT_TYPE:
       Cast<WasmValueObject>(*this)->WasmValueObjectPrint(os);
       break;
@@ -555,7 +557,6 @@ bool IsTheHoleAt(Tagged<FixedDoubleArray> array, int index) {
   return array->is_the_hole(index);
 }
 
-#ifdef V8_ENABLE_UNDEFINED_DOUBLE
 template <class T>
 bool IsUndefinedAt(Tagged<T> array, int index) {
   return false;
@@ -563,9 +564,12 @@ bool IsUndefinedAt(Tagged<T> array, int index) {
 
 template <>
 bool IsUndefinedAt(Tagged<FixedDoubleArray> array, int index) {
+#ifdef V8_ENABLE_UNDEFINED_DOUBLE
   return array->is_undefined(index);
-}
+#else
+  return false;
 #endif  // V8_ENABLE_UNDEFINED_DOUBLE
+}
 
 template <class T>
 double GetScalarElement(Tagged<T> array, int index) {
@@ -577,7 +581,7 @@ double GetScalarElement(Tagged<T> array, int index) {
 
 template <class T>
 void DoPrintElements(std::ostream& os, Tagged<Object> object, int length) {
-  const bool print_the_hole = std::is_same_v<T, FixedDoubleArray>;
+  const bool print_nans = std::is_same_v<T, FixedDoubleArray>;
   Tagged<T> array = Cast<T>(object);
   if (length == 0) return;
   int previous_index = 0;
@@ -596,14 +600,17 @@ void DoPrintElements(std::ostream& os, Tagged<Object> object, int length) {
       ss << '-' << (i - 1);
     }
     os << std::setw(12) << ss.str() << ": ";
-    if (print_the_hole && IsTheHoleAt(array, i - 1)) {
+    if (print_nans && IsTheHoleAt(array, i - 1)) {
       os << "<the_hole>";
-#ifdef V8_ENABLE_UNDEFINED_DOUBLE
-    } else if (IsUndefinedAt(array, i - 1)) {
+    } else if (print_nans && IsUndefinedAt(array, i - 1)) {
       os << "undefined";
-#endif  // V8_ENABLE_UNDEFINED_DOUBLE
     } else {
-      os << GetScalarElement(array, i - 1);
+      auto value = GetScalarElement(array, i - 1);
+      os << value;
+      if constexpr (print_nans) {
+        os << " (0x" << std::hex << base::double_to_uint64(value) << std::dec
+           << ")";
+      }
     }
     previous_index = i;
     previous_representation = representation;
@@ -640,7 +647,6 @@ void PrintTypedArrayElements(std::ostream& os, const ElementType* data_ptr,
     if (previous_index != i - 1) {
       ss << '-' << (i - 1);
     }
-#ifdef V8_ENABLE_UNDEFINED_DOUBLE
     if constexpr (std::is_floating_point_v<ElementType>) {
       if (std::isnan(previous_value)) {
         os << std::setw(12) << ss.str() << ": " << +previous_value << " (0x"
@@ -656,7 +662,6 @@ void PrintTypedArrayElements(std::ostream& os, const ElementType* data_ptr,
         continue;
       }
     }
-#endif  // V8_ENABLE_UNDEFINED_DOUBLE
     os << std::setw(12) << ss.str() << ": " << +previous_value;
     previous_index = i;
     previous_value = value;
@@ -880,7 +885,8 @@ void JSObject::JSObjectPrint(std::ostream& os) {
 
 void JSExternalObject::JSExternalObjectPrint(std::ostream& os) {
   JSObjectPrintHeader(os, *this, nullptr);
-  os << "\n - external value: " << value();
+  os << "\n - external value: "
+     << value({kFirstExternalTypeTag, kLastExternalTypeTag});
   JSObjectPrintBody(os, *this);
 }
 
@@ -1716,7 +1722,6 @@ void FeedbackCell::FeedbackCellPrint(std::ostream& os) {
   }
   os << "\n - value: " << Brief(value());
   os << "\n - interrupt_budget: " << interrupt_budget();
-#ifdef V8_ENABLE_LEAPTIERING
   os << "\n - dispatch_handle: 0x" << std::hex << dispatch_handle() << std::dec;
   JSDispatchTable* jdt = IsolateGroup::current()->js_dispatch_table();
   if (dispatch_handle() != kNullJSDispatchHandle &&
@@ -1729,7 +1734,6 @@ void FeedbackCell::FeedbackCellPrint(std::ostream& os) {
     jdt->PrintCurrentTieringRequest(dispatch_handle(), Isolate::Current(), os);
   }
 
-#endif  // V8_ENABLE_LEAPTIERING
   os << "\n";
 }
 
@@ -1804,19 +1808,7 @@ void FeedbackVector::FeedbackVectorPrint(std::ostream& os) {
   }
 
   os << "\n - shared function info: " << Brief(shared_function_info());
-#ifdef V8_ENABLE_LEAPTIERING
   os << "\n - tiering_in_progress: " << tiering_in_progress();
-#else
-  os << "\n - tiering state: " << tiering_state();
-  if (has_optimized_code()) {
-    os << "\n - optimized code: "
-       << Brief(optimized_code(GetCurrentIsolateForSandbox()));
-  } else {
-    os << "\n - no optimized code";
-  }
-  os << "\n - maybe has maglev code: " << maybe_has_maglev_code();
-  os << "\n - maybe has turbofan code: " << maybe_has_turbofan_code();
-#endif  // !V8_ENABLE_LEAPTIERING
   os << "\n - osr_tiering_in_progress: " << osr_tiering_in_progress();
   os << "\n - invocation count: " << invocation_count();
   os << "\n - closure feedback cell array: ";
@@ -2434,7 +2426,6 @@ void JSFunction::JSFunctionPrint(std::ostream& os) {
   os << "\n - kind: " << shared()->kind();
   os << "\n - context: " << Brief(context());
   os << "\n - code: " << Brief(code(isolate));
-#ifdef V8_ENABLE_LEAPTIERING
   os << "\n - dispatch_handle: 0x" << std::hex << dispatch_handle() << std::dec;
   if (has_feedback_vector() &&
       raw_feedback_cell()->dispatch_handle() != dispatch_handle()) {
@@ -2450,7 +2441,6 @@ void JSFunction::JSFunctionPrint(std::ostream& os) {
         dispatch_handle(), Isolate::Current(), os);
   }
 
-#endif  // V8_ENABLE_LEAPTIERING
   CodeKind code_kind = code(isolate)->kind();
   if (code_kind == CodeKind::FOR_TESTING) {
     os << "\n - FOR_TESTING";
@@ -2629,6 +2619,7 @@ void Code::CodePrint(std::ostream& os, const char* name, Address current_pc) {
   os << "\n - instruction_stream: " << Brief(raw_instruction_stream());
   os << "\n - instruction_start: "
      << reinterpret_cast<void*>(instruction_start());
+  os << "\n - is_disabled_builtin: " << is_disabled_builtin();
   os << "\n - is_turbofanned: " << is_turbofanned();
   os << "\n - stack_slots: " << stack_slots();
   os << "\n - marked_for_deoptimization: " << marked_for_deoptimization();
@@ -2660,10 +2651,8 @@ void Code::CodePrint(std::ostream& os, const char* name, Address current_pc) {
        << Brief(istream->relocation_info());
     os << "\n - instruction_stream.body_size: " << istream->body_size();
   }
-#ifdef V8_ENABLE_LEAPTIERING
   os << "\n - dispatch_handle: 0x" << std::hex << js_dispatch_handle()
      << std::dec;
-#endif  // V8_ENABLE_LEAPTIERING
   os << "\n";
 
   // Finally, the disassembly:
@@ -3048,6 +3037,22 @@ void WasmDispatchTable::WasmDispatchTablePrint(std::ostream& os) {
   os << "\n";
 }
 
+void WasmDispatchTableForImports::WasmDispatchTableForImportsPrint(
+    std::ostream& os) {
+  PrintHeader(os, "WasmDispatchTableForImports");
+  int len = length();
+  os << "\n - length: " << len;
+  // Only print up to 55 elements; otherwise print the first 50 and "[...]".
+  int printed = len > 55 ? 50 : len;
+  for (int i = 0; i < printed; ++i) {
+    os << "\n " << std::setw(8) << i
+       << ": target: " << AsHex::Address(target(i).value())
+       << "; implicit_arg: " << Brief(implicit_arg(i));
+  }
+  if (printed != len) os << "\n  [...]";
+  os << "\n";
+}
+
 // Never called directly, as WasmFunctionData is an "abstract" class.
 void WasmFunctionData::WasmFunctionDataPrint(std::ostream& os) {
   IsolateForSandbox isolate = GetCurrentIsolateForSandbox();
@@ -3065,15 +3070,16 @@ void WasmExportedFunctionData::WasmExportedFunctionDataPrint(std::ostream& os) {
   os << "\n - function_index: " << function_index();
   os << "\n - wrapper_budget: " << wrapper_budget()->value();
   os << "\n - receiver_is_first_param: " << receiver_is_first_param();
-  os << "\n - sig: " << sig() << " (" << sig()->parameter_count() << " params, "
-     << sig()->return_count() << " returns)";
+  os << "\n - packed_args_size: " << packed_args_size();
+  os << "\n - c_wrapper_code: "
+     << c_wrapper_code(GetCurrentIsolateForSandbox());
   os << "\n";
 }
 
 void WasmJSFunctionData::WasmJSFunctionDataPrint(std::ostream& os) {
   PrintHeader(os, "WasmJSFunctionData");
   WasmFunctionDataPrint(os);
-  os << "\n - canonical_sig_index: " << canonical_sig_index();
+  os << "\n - offheap_data: " << offheap_data();
   os << "\n";
 }
 
@@ -3113,6 +3119,8 @@ void WasmInternalFunction::WasmInternalFunctionPrint(std::ostream& os) {
   os << "\n - call target: [" << call_target().value() << "] -> "
      << AsHex::Address(wasm::GetProcessWideWasmCodePointerTable()
                            ->GetEntrypointWithoutSignatureCheck(call_target()));
+  os << "\n - sig: " << sig() << " (" << sig()->parameter_count() << " params, "
+     << sig()->return_count() << " returns)";
   os << "\n";
 }
 
@@ -3127,8 +3135,6 @@ void WasmCapiFunctionData::WasmCapiFunctionDataPrint(std::ostream& os) {
   PrintHeader(os, "WasmCapiFunctionData");
   WasmFunctionDataPrint(os);
   os << "\n - embedder_data: " << Brief(embedder_data());
-  os << "\n - sig: " << sig() << " (" << sig()->parameter_count() << " params, "
-     << sig()->return_count() << " returns)";
   os << "\n";
 }
 
@@ -3507,7 +3513,8 @@ void ScopeInfo::ScopeInfoPrint(std::ostream& os) {
   }
   if (ClassScopeHasPrivateBrand()) os << "\n - class scope has private brand";
   if (HasSavedClassVariable()) os << "\n - has saved class variable";
-  if (HasNewTarget()) os << "\n - needs new target";
+  if (CanOnlyAccessFixedFormalParameters())
+    os << "\n - can only access fixed formal parameters";
   if (HasFunctionName()) {
     os << "\n - function name(" << FunctionVariableBits::decode(flags) << "): ";
     ShortPrint(FunctionName(), os);
@@ -4012,6 +4019,10 @@ void HeapObject::HeapObjectShortPrint(std::ostream& os) {
     case WASM_DISPATCH_TABLE_TYPE:
       os << "<WasmDispatchTable["
          << TrustedCast<WasmDispatchTable>(*this)->length() << "]>";
+      break;
+    case WASM_DISPATCH_TABLE_FOR_IMPORTS_TYPE:
+      os << "<WasmDispatchTableForImports["
+         << TrustedCast<WasmDispatchTableForImports>(*this)->length() << "]>";
       break;
 #endif  // V8_ENABLE_WEBASSEMBLY
     default:
@@ -4534,13 +4545,11 @@ V8_DEBUGGING_EXPORT extern "C" void _v8_internal_Print_Code(void* object) {
 #endif
 }
 
-#ifdef V8_ENABLE_LEAPTIERING
 V8_DEBUGGING_EXPORT extern "C" void _v8_internal_Print_Dispatch_Handle(
     uint32_t handle) {
   i::IsolateGroup::current()->js_dispatch_table()->PrintEntry(
       i::JSDispatchHandle(handle));
 }
-#endif  // V8_ENABLE_LEAPTIERING
 
 V8_DEBUGGING_EXPORT extern "C" void _v8_internal_Print_OnlyCode(
     void* object, size_t range_limit) {

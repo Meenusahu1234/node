@@ -2003,7 +2003,8 @@ TEST(TestSizeOfRegExpCode) {
     heap::InvokeMemoryReducingMajorGCs(heap);
     if (heap->sweeping_in_progress()) {
       heap->EnsureSweepingCompleted(
-          Heap::SweepingForcedFinalizationMode::kV8Only);
+          Heap::SweepingForcedFinalizationMode::kV8Only,
+          CompleteSweepingReason::kTesting);
     }
   }
   int initial_size = static_cast<int>(heap->SizeOfObjects());
@@ -2054,7 +2055,8 @@ HEAP_TEST(TestSizeOfObjects) {
     heap::InvokeMemoryReducingMajorGCs(heap);
     if (heap->sweeping_in_progress()) {
       heap->EnsureSweepingCompleted(
-          Heap::SweepingForcedFinalizationMode::kV8Only);
+          Heap::SweepingForcedFinalizationMode::kV8Only,
+          CompleteSweepingReason::kTesting);
     }
   }
   int initial_size = static_cast<int>(heap->SizeOfObjects());
@@ -2084,8 +2086,8 @@ HEAP_TEST(TestSizeOfObjects) {
   // Waiting for sweeper threads should not change heap size.
   if (heap->sweeping_in_progress()) {
     DisableConservativeStackScanningScopeForTesting no_stack_scanning(heap);
-    heap->EnsureSweepingCompleted(
-        Heap::SweepingForcedFinalizationMode::kV8Only);
+    heap->EnsureSweepingCompleted(Heap::SweepingForcedFinalizationMode::kV8Only,
+                                  CompleteSweepingReason::kTesting);
   }
   CHECK_EQ(initial_size, static_cast<int>(heap->SizeOfObjects()));
 }
@@ -2682,8 +2684,8 @@ HEAP_TEST(GCFlags) {
   CHECK_EQ(heap->current_gc_flags_, GCFlag::kNoFlags);
 
   if (heap->sweeping_in_progress()) {
-    heap->EnsureSweepingCompleted(
-        Heap::SweepingForcedFinalizationMode::kV8Only);
+    heap->EnsureSweepingCompleted(Heap::SweepingForcedFinalizationMode::kV8Only,
+                                  CompleteSweepingReason::kTesting);
   }
 
   IncrementalMarking* marking = heap->incremental_marking();
@@ -5769,7 +5771,8 @@ HEAP_TEST(Regress587004) {
   heap::InvokeMajorGC(heap);
   heap::SimulateFullSpace(heap->old_space());
   heap->RightTrimArray(*array, 1, N);
-  heap->EnsureSweepingCompleted(Heap::SweepingForcedFinalizationMode::kV8Only);
+  heap->EnsureSweepingCompleted(Heap::SweepingForcedFinalizationMode::kV8Only,
+                                CompleteSweepingReason::kTesting);
   Tagged<ByteArray> byte_array;
   const int M = 256;
   // Don't allow old space expansion. The test works without this flag too,
@@ -5942,8 +5945,8 @@ TEST(Regress598319) {
   // GC to cleanup state
   heap::InvokeMajorGC(heap);
   if (heap->sweeping_in_progress()) {
-    heap->EnsureSweepingCompleted(
-        Heap::SweepingForcedFinalizationMode::kV8Only);
+    heap->EnsureSweepingCompleted(Heap::SweepingForcedFinalizationMode::kV8Only,
+                                  CompleteSweepingReason::kTesting);
   }
 
   CHECK(heap->lo_space()->Contains(arr.get()));
@@ -5993,7 +5996,8 @@ TEST(Regress598319) {
     }
   }
 
-  IsolateSafepointScope safepoint_scope(heap);
+  SafepointScope safepoint_scope(heap->isolate(),
+                                 kGlobalSafepointForSharedSpaceIsolate);
   MarkingBarrier::PublishAll(heap);
 
   // Finish marking with bigger steps to speed up test.
@@ -6014,17 +6018,20 @@ TEST(Regress598319) {
 }
 
 DirectHandle<FixedArray> ShrinkArrayAndCheckSize(Heap* heap, int length) {
+  DisableConservativeStackScanningScopeForTesting no_stack_scanning(heap);
   // Make sure there is no garbage and the compilation cache is empty.
   for (int i = 0; i < 5; i++) {
     heap::InvokeMajorGC(heap);
   }
-  heap->EnsureSweepingCompleted(Heap::SweepingForcedFinalizationMode::kV8Only);
+  heap->EnsureSweepingCompleted(Heap::SweepingForcedFinalizationMode::kV8Only,
+                                CompleteSweepingReason::kTesting);
   // Disable LAB, such that calculations with SizeOfObjects() and object size
   // are correct.
   heap->DisableInlineAllocation();
   size_t size_before_allocation = heap->SizeOfObjects();
-  DirectHandle<FixedArray> array =
-      heap->isolate()->factory()->NewFixedArray(length, AllocationType::kOld);
+  IndirectHandle<FixedArray> array(
+      *heap->isolate()->factory()->NewFixedArray(length, AllocationType::kOld),
+      heap->isolate());
   size_t size_after_allocation = heap->SizeOfObjects();
   CHECK_EQ(size_after_allocation, size_before_allocation + array->Size());
   array->RightTrim(heap->isolate(), 1);
@@ -6033,7 +6040,8 @@ DirectHandle<FixedArray> ShrinkArrayAndCheckSize(Heap* heap, int length) {
   CHECK_EQ(size_after_allocation, size_after_shrinking);
   // GC and sweeping updates the size to account for shrinking.
   heap::InvokeMajorGC(heap);
-  heap->EnsureSweepingCompleted(Heap::SweepingForcedFinalizationMode::kV8Only);
+  heap->EnsureSweepingCompleted(Heap::SweepingForcedFinalizationMode::kV8Only,
+                                CompleteSweepingReason::kTesting);
   intptr_t size_after_gc = heap->SizeOfObjects();
   CHECK_EQ(size_after_gc, size_before_allocation + array->Size());
   return array;
@@ -6069,8 +6077,8 @@ TEST(Regress615489) {
 
   i::IncrementalMarking* marking = heap->incremental_marking();
   if (heap->sweeping_in_progress()) {
-    heap->EnsureSweepingCompleted(
-        Heap::SweepingForcedFinalizationMode::kV8Only);
+    heap->EnsureSweepingCompleted(Heap::SweepingForcedFinalizationMode::kV8Only,
+                                  CompleteSweepingReason::kTesting);
   }
   CHECK(marking->IsMarking() || marking->IsStopped());
   if (marking->IsStopped()) {
@@ -6169,8 +6177,8 @@ TEST(ContinuousRightTrimFixedArrayInBlackArea) {
 
   i::IncrementalMarking* marking = heap->incremental_marking();
   if (heap->sweeping_in_progress()) {
-    heap->EnsureSweepingCompleted(
-        Heap::SweepingForcedFinalizationMode::kV8Only);
+    heap->EnsureSweepingCompleted(Heap::SweepingForcedFinalizationMode::kV8Only,
+                                  CompleteSweepingReason::kTesting);
   }
   CHECK(marking->IsMarking() || marking->IsStopped());
   if (marking->IsStopped()) {
@@ -6233,8 +6241,8 @@ TEST(RightTrimFixedArrayWithBlackAllocatedPages) {
 
   i::IncrementalMarking* marking = heap->incremental_marking();
   if (heap->sweeping_in_progress()) {
-    heap->EnsureSweepingCompleted(
-        Heap::SweepingForcedFinalizationMode::kV8Only);
+    heap->EnsureSweepingCompleted(Heap::SweepingForcedFinalizationMode::kV8Only,
+                                  CompleteSweepingReason::kTesting);
   }
   CHECK(marking->IsMarking() || marking->IsStopped());
   if (marking->IsStopped()) {
@@ -6683,16 +6691,18 @@ HEAP_TEST(Regress670675) {
   heap::InvokeMajorGC(heap);
 
   heap->EnsureSweepingCompleted(
-      Heap::SweepingForcedFinalizationMode::kUnifiedHeap);
+      Heap::SweepingForcedFinalizationMode::kUnifiedHeap,
+      CompleteSweepingReason::kTesting);
   heap->tracer()->StopFullCycleIfFinished();
   i::IncrementalMarking* marking = CcTest::heap()->incremental_marking();
   if (marking->IsStopped()) {
-    IsolateSafepointScope safepoint_scope(heap);
+    SafepointScope safepoint_scope(heap->isolate(),
+                                   kGlobalSafepointForSharedSpaceIsolate);
     heap->tracer()->StartCycle(
         GarbageCollector::MARK_COMPACTOR, GarbageCollectionReason::kTesting,
         "collector cctest", GCTracer::MarkingType::kIncremental);
     marking->Start(GarbageCollector::MARK_COMPACTOR,
-                   i::GarbageCollectionReason::kTesting);
+                   i::GarbageCollectionReason::kTesting, "testing");
   }
   size_t array_length = 128 * KB;
   size_t n = heap->OldGenerationSpaceAvailable() / array_length;
@@ -6743,8 +6753,8 @@ HEAP_TEST(RegressMissingWriteBarrierInAllocate) {
   heap::SimulateIncrementalMarking(heap, true);
   heap::InvokeMajorGC(heap);
   if (heap->sweeping_in_progress()) {
-    heap->EnsureSweepingCompleted(
-        Heap::SweepingForcedFinalizationMode::kV8Only);
+    heap->EnsureSweepingCompleted(Heap::SweepingForcedFinalizationMode::kV8Only,
+                                  CompleteSweepingReason::kTesting);
   }
   CHECK(IsMap(object->map()));
 }
@@ -7289,12 +7299,16 @@ UNINITIALIZED_TEST(HugeHeapLimit) {
 
 UNINITIALIZED_TEST(HeapLimit) {
   uint64_t kMemoryGB = 8;
+  v8_flags.high_end_android_physical_memory_threshold =
+      static_cast<unsigned int>(kMemoryGB);
   v8::Isolate::CreateParams create_params;
   create_params.array_buffer_allocator = CcTest::array_buffer_allocator();
   create_params.constraints.ConfigureDefaults(kMemoryGB * GB, kMemoryGB * GB);
   v8::Isolate* isolate = v8::Isolate::New(create_params);
   Isolate* i_isolate = reinterpret_cast<Isolate*>(isolate);
-#if defined(V8_TARGET_ARCH_64_BIT) && !defined(V8_OS_ANDROID)
+#if defined(V8_TARGET_ARCH_64_BIT)
+  // Because we explicitly set --high_end_android_physical_memory_threshold,
+  // Android has the same expected heap limit.
   size_t kExpectedHeapLimit = size_t{2} * GB;
 #else
   size_t kExpectedHeapLimit = size_t{1} * GB;

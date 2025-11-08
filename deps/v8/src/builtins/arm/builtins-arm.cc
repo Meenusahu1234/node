@@ -973,19 +973,6 @@ void Builtins::Generate_BaselineOutOfLinePrologue(MacroAssembler* masm) {
     __ AssertFeedbackVector(feedback_vector, temporary);
   }
 
-#ifndef V8_ENABLE_LEAPTIERING
-  // Check the tiering state.
-  Label flags_need_processing;
-  Register flags = no_reg;
-  {
-    UseScratchRegisterScope temps(masm);
-    // flags will be used only in |flags_need_processing|
-    // and outside it can be reused.
-    flags = temps.Acquire();
-    __ LoadFeedbackVectorFlagsAndJumpIfNeedsProcessing(
-        flags, feedback_vector, CodeKind::BASELINE, &flags_need_processing);
-  }
-#endif  // !V8_ENABLE_LEAPTIERING
 
   {
     UseScratchRegisterScope temps(masm);
@@ -1067,20 +1054,6 @@ void Builtins::Generate_BaselineOutOfLinePrologue(MacroAssembler* masm) {
   __ LoadRoot(kInterpreterAccumulatorRegister, RootIndex::kUndefinedValue);
   __ Ret();
 
-#ifndef V8_ENABLE_LEAPTIERING
-  __ bind(&flags_need_processing);
-  {
-    ASM_CODE_COMMENT_STRING(masm, "Optimized marker check");
-    UseScratchRegisterScope temps(masm);
-    // Ensure the flags is not allocated again.
-    temps.Exclude(flags);
-
-    // Drop the frame created by the baseline call.
-    __ ldm(ia_w, sp, {fp, lr});
-    __ OptimizeCodeOrTailCallOptimizedCodeSlot(flags, feedback_vector);
-    __ Trap();
-  }
-#endif  // !V8_ENABLE_LEAPTIERING
 
   __ bind(&call_stack_guard);
   {
@@ -1154,15 +1127,6 @@ void Builtins::Generate_InterpreterEntryTrampoline(
   __ LoadFeedbackVector(feedback_vector, closure, r4, &push_stack_frame);
 
 #ifndef V8_JITLESS
-#ifndef V8_ENABLE_LEAPTIERING
-  // If feedback vector is valid, check for optimized code and update invocation
-  // count.
-  Register flags = r4;
-  Label flags_need_processing;
-  __ LoadFeedbackVectorFlagsAndJumpIfNeedsProcessing(
-      flags, feedback_vector, CodeKind::INTERPRETED_FUNCTION,
-      &flags_need_processing);
-#endif  // !V8_ENABLE_LEAPTIERING
 
   ResetFeedbackVectorOsrUrgency(masm, feedback_vector, r4);
 
@@ -1316,40 +1280,9 @@ void Builtins::Generate_InterpreterEntryTrampoline(
   __ jmp(&after_stack_check_interrupt);
 
 #ifndef V8_JITLESS
-#ifndef V8_ENABLE_LEAPTIERING
-  __ bind(&flags_need_processing);
-  __ OptimizeCodeOrTailCallOptimizedCodeSlot(flags, feedback_vector);
-#endif  // !V8_ENABLE_LEAPTIERING
 
   __ bind(&is_baseline);
   {
-#ifndef V8_ENABLE_LEAPTIERING
-    // Load the feedback vector from the closure.
-    __ ldr(feedback_vector,
-           FieldMemOperand(closure, JSFunction::kFeedbackCellOffset));
-    __ ldr(feedback_vector,
-           FieldMemOperand(feedback_vector, FeedbackCell::kValueOffset));
-
-    Label install_baseline_code;
-    // Check if feedback vector is valid. If not, call prepare for baseline to
-    // allocate it.
-    __ ldr(r8, FieldMemOperand(feedback_vector, HeapObject::kMapOffset));
-    __ ldrh(r8, FieldMemOperand(r8, Map::kInstanceTypeOffset));
-    __ cmp(r8, Operand(FEEDBACK_VECTOR_TYPE));
-    __ b(ne, &install_baseline_code);
-
-    // Check the tiering state.
-    __ LoadFeedbackVectorFlagsAndJumpIfNeedsProcessing(
-        flags, feedback_vector, CodeKind::BASELINE, &flags_need_processing);
-
-    // oad the baseline code into the closure.
-    __ mov(r2, kInterpreterBytecodeArrayRegister);
-    static_assert(kJavaScriptCallCodeStartRegister == r2, "ABI mismatch");
-    __ ReplaceClosureCodeWithOptimizedCode(r2, closure);
-    __ JumpCodeObject(r2);
-
-    __ bind(&install_baseline_code);
-#endif  // !V8_ENABLE_LEAPTIERING
     __ GenerateTailCallToReturnedCode(Runtime::kInstallBaselineCode);
   }
 #endif  // !V8_JITLESS
@@ -2858,6 +2791,12 @@ void Builtins::Generate_WasmLiftoffFrameSetup(MacroAssembler* masm) {
   __ ldr(vector, FieldMemOperand(vector, OFFSET_OF_DATA_START(FixedArray)));
   __ JumpIfSmi(vector, &allocate_vector);
   __ bind(&done);
+
+  // Increment the total invocation count of the function.
+  __ ldr(scratch, FieldMemOperand(vector, OFFSET_OF_DATA_START(FixedArray)));
+  __ add(scratch, scratch, Operand(Smi::FromInt(1)));
+  __ str(scratch, FieldMemOperand(vector, OFFSET_OF_DATA_START(FixedArray)));
+
   __ push(kWasmImplicitArgRegister);
   __ push(vector);
   __ Ret();
@@ -3382,6 +3321,43 @@ void Builtins::Generate_WasmFXResume(MacroAssembler* masm) {
   __ bind(&suspend);
   __ LeaveFrame(StackFrame::WASM_STACK_EXIT);
   __ Jump(lr);
+}
+
+void Builtins::Generate_WasmFXSuspend(MacroAssembler* masm) {
+  __ EnterFrame(StackFrame::WASM_STACK_EXIT);
+  Register tag = WasmFXSuspendDescriptor::GetRegisterParameter(0);
+  Register cont = WasmFXSuspendDescriptor::GetRegisterParameter(1);
+  Label resume;
+  __ Push(cont, kContextRegister);
+  {
+    FrameScope scope(masm, StackFrame::MANUAL);
+    __ PrepareCallCFunction(6);
+    __ str(tag, MemOperand(sp, 0));                    // arg 4
+    __ str(cont, MemOperand(sp, kSystemPointerSize));  // arg 5
+    __ Move(kCArgRegs[0], ExternalReference::isolate_address());
+    __ Move(kCArgRegs[1], sp);
+    __ Move(kCArgRegs[2], fp);
+    __ GetLabelAddress(kCArgRegs[3], &resume);
+    __ CallCFunction(ExternalReference::wasm_suspend_wasmfx_stack(), 6);
+  }
+  Register target_stack = r1;
+  __ Move(target_stack, kReturnRegister0);
+  cont = kReturnRegister0;
+  __ Pop(cont, kContextRegister);
+
+  Label ok;
+  __ cmp(target_stack, Operand(0));
+  __ b(ne, &ok);
+  // No handler found.
+  __ CallRuntime(Runtime::kThrowWasmSuspendError);
+
+  __ bind(&ok);
+  DCHECK_EQ(cont, kReturnRegister0);
+  LoadJumpBuffer(masm, target_stack, true, r3);
+  __ Trap();
+  __ bind(&resume);
+  __ LeaveFrame(StackFrame::WASM_STACK_EXIT);
+  __ Ret();
 }
 
 void Builtins::Generate_WasmFXReturn(MacroAssembler* masm) {

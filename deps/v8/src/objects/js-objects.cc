@@ -1916,13 +1916,9 @@ Maybe<bool> GetPropertyDescriptorWithInterceptor(LookupIterator* it,
     // Request was successfully intercepted, try to set the property
     // descriptor.
     args.AcceptSideEffects();
-    Utils::ApiCheck(
-        PropertyDescriptor::ToPropertyDescriptor(isolate, result, desc),
-        it->IsElement(*holder) ? "v8::IndexedPropertyDescriptorCallback"
-                               : "v8::NamedPropertyDescriptorCallback",
-        "Invalid property descriptor.");
-
-    return Just(true);
+    bool is_descriptor =
+        PropertyDescriptor::ToPropertyDescriptor(isolate, result, desc);
+    return is_descriptor ? Just(true) : Nothing<bool>();
   }
 
   it->Next();
@@ -2800,7 +2796,8 @@ void JSObject::SetNormalizedProperty(DirectHandle<JSObject> object,
       details = details.set_cell_type(cell_type);
       auto cell = isolate->factory()->NewPropertyCell(name, details, value);
       dictionary =
-          GlobalDictionary::Add(isolate, dictionary, name, cell, details);
+          GlobalDictionary::Add(isolate, dictionary, name, cell, details)
+              .ToHandleChecked();
       global_obj->set_global_dictionary(*dictionary, kReleaseStore);
     } else {
       PropertyCell::PrepareForAndSetValue(isolate, dictionary, entry, value,
@@ -2830,7 +2827,8 @@ void JSObject::SetNormalizedProperty(DirectHandle<JSObject> object,
         DCHECK_IMPLIES(object->map()->is_prototype_map(),
                        !object->map()->IsPrototypeValidityCellValid());
         dictionary =
-            NameDictionary::Add(isolate, dictionary, name, value, details);
+            NameDictionary::Add(isolate, dictionary, name, value, details)
+                .ToHandleChecked();
         object->SetProperties(*dictionary);
       } else {
         PropertyDetails original_details = dictionary->DetailsAt(entry);
@@ -2915,14 +2913,15 @@ void JSObject::JSObjectShortPrint(StringStream* accumulator) {
         accumulator->Add("<JSFunction");
       }
       if (v8_flags.trace_file_names) {
-        Tagged<Object> source_name =
-            Cast<Script>(function->shared()->script())->name();
-        if (IsString(source_name)) {
-          Tagged<String> str = Cast<String>(source_name);
-          if (str->length() > 0) {
-            accumulator->Add(" <");
-            accumulator->Put(str);
-            accumulator->Add(">");
+        if (Tagged<Script> script;
+            TryCast<Script>(function->shared()->script(), &script)) {
+          Tagged<Object> source_name = script->name();
+          if (Tagged<String> str; TryCast<String>(source_name, &str)) {
+            if (str->length() > 0) {
+              accumulator->Add(" <");
+              accumulator->Put(str);
+              accumulator->Add(">");
+            }
           }
         }
       }
@@ -3038,17 +3037,16 @@ void JSObject::PrintInstanceMigration(FILE* file, Tagged<Map> original_map,
   for (InternalIndex i : original_map->IterateOwnDescriptors()) {
     Representation o_r = o->GetDetails(i).representation();
     Representation n_r = n->GetDetails(i).representation();
+    Tagged<Name> name = o->GetKey(i);
+    if (IsString(name)) {
+      Cast<String>(name)->PrintOn(file);
+    } else {
+      PrintF(file, "{symbol %p}", reinterpret_cast<void*>(name.ptr()));
+    }
     if (!o_r.Equals(n_r)) {
-      Cast<String>(o->GetKey(i))->PrintOn(file);
       PrintF(file, ":%s->%s ", o_r.Mnemonic(), n_r.Mnemonic());
     } else if (o->GetDetails(i).location() == PropertyLocation::kDescriptor &&
                n->GetDetails(i).location() == PropertyLocation::kField) {
-      Tagged<Name> name = o->GetKey(i);
-      if (IsString(name)) {
-        Cast<String>(name)->PrintOn(file);
-      } else {
-        PrintF(file, "{symbol %p}", reinterpret_cast<void*>(name.ptr()));
-      }
       PrintF(file, " ");
     }
   }
@@ -3398,7 +3396,8 @@ void MigrateFastToSlow(Isolate* isolate, DirectHandle<JSObject> object,
       ord_dictionary =
           SwissNameDictionary::Add(isolate, ord_dictionary, key, value, d);
     } else {
-      dictionary = NameDictionary::Add(isolate, dictionary, key, value, d);
+      dictionary = NameDictionary::Add(isolate, dictionary, key, value, d)
+                       .ToHandleChecked();
     }
   }
 
@@ -5145,17 +5144,23 @@ bool JSObject::UnregisterPrototypeUser(DirectHandle<Map> user,
   DCHECK(IsPrototypeInfo(user->prototype_info()));
   // If it had no prototype before, see if it had users that might expect
   // registration.
-  if (!IsJSObject(user->prototype())) {
+  if (!IsAnyObjectThatCanBeTrackedAsPrototype(user->prototype())) {
     Tagged<Object> users =
         Cast<PrototypeInfo>(user->prototype_info())->prototype_users();
     return IsWeakArrayList(users);
   }
-  DirectHandle<JSObject> prototype(Cast<JSObject>(user->prototype()), isolate);
+  DirectHandle<JSReceiver> prototype(Cast<JSReceiver>(user->prototype()),
+                                     isolate);
   DirectHandle<PrototypeInfo> user_info =
       Map::GetOrCreatePrototypeInfo(user, isolate);
   int slot = user_info->registry_slot();
   if (slot == PrototypeInfo::UNREGISTERED) return false;
+#if V8_ENABLE_WEBASSEMBLY
+  DCHECK(prototype->map()->is_prototype_map() ||
+         IsWasmObjectMap(prototype->map()));
+#else
   DCHECK(prototype->map()->is_prototype_map());
+#endif  // V8_ENABLE_WEBASSEMBLY
   Tagged<Object> maybe_proto_info = prototype->map()->prototype_info();
   // User knows its registry slot, prototype info and user registry must exist.
   DCHECK(IsPrototypeInfo(maybe_proto_info));

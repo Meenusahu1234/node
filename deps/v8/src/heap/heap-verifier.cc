@@ -84,9 +84,9 @@ class VerifyPointersVisitor : public HeapVisitor<VerifyPointersVisitor>,
 
   void VisitRootPointers(Root root, const char* description,
                          FullObjectSlot start, FullObjectSlot end) override;
-  void VisitRootPointers(Root root, const char* description,
-                         OffHeapObjectSlot start,
-                         OffHeapObjectSlot end) override;
+  void VisitCompressedRootPointers(Root root, const char* description,
+                                   OffHeapObjectSlot start,
+                                   OffHeapObjectSlot end) override;
   void VisitMapPointer(Tagged<HeapObject> host) override;
 
  protected:
@@ -132,10 +132,10 @@ void VerifyPointersVisitor::VisitRootPointers(Root root,
   VerifyPointersImpl(start, end);
 }
 
-void VerifyPointersVisitor::VisitRootPointers(Root root,
-                                              const char* description,
-                                              OffHeapObjectSlot start,
-                                              OffHeapObjectSlot end) {
+void VerifyPointersVisitor::VisitCompressedRootPointers(Root root,
+                                                        const char* description,
+                                                        OffHeapObjectSlot start,
+                                                        OffHeapObjectSlot end) {
   VerifyPointersImpl(start, end);
 }
 
@@ -340,7 +340,7 @@ void HeapVerification::Verify() {
   SafepointScope safepoint_scope(isolate(), safepoint_kind);
   HandleScope scope(isolate());
 
-  heap()->MakeHeapIterable();
+  heap()->MakeHeapIterable(CompleteSweepingReason::kTesting);
   heap()->FreeLinearAllocationAreas();
 
   // TODO(v8:13257): Currently we don't iterate through the stack conservatively

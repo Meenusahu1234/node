@@ -542,6 +542,7 @@ class CallSiteFeedback {
     if (is_monomorphic()) return index_or_count_;
     return polymorphic_storage()[i].function_index;
   }
+  // The call count of the function at this particular call site.
   int call_count(int i) const {
     DCHECK(!is_invalid() && !is_megamorphic());
     if (is_monomorphic()) return static_cast<int>(frequency_or_ool_);
@@ -581,6 +582,9 @@ struct FunctionTypeFeedback {
   // For "call", it holds the index of the called function, for "call_indirect"
   // and "call_ref" the value will be a sentinel {kCallIndirect} / {kCallRef}.
   base::OwnedVector<uint32_t> call_targets;
+
+  // The number of times this function was invoked.
+  int num_invocations = 0;
 
   // {tierup_priority} is updated and used when triggering tier-up.
   // TODO(clemensb): This does not belong here; find a better place.
@@ -647,14 +651,10 @@ struct CompilationPriority {
   int optimization_priority;
 };
 using CompilationPriorities = std::unordered_map<uint32_t, CompilationPriority>;
-struct Uint32PairHash {
-  size_t operator()(const std::pair<uint32_t, uint32_t> pair) const {
-    return base::hash_value(pair);
-  }
-};
-// Maps from function index and byte offset in the function to frequency.
+// Maps from function index to a vector of byte offset in the function and
+// frequency.
 using InstructionFrequencies =
-    std::unordered_map<std::pair<uint32_t, uint32_t>, uint8_t, Uint32PairHash>;
+    std::unordered_map<uint32_t, std::vector<std::pair<uint32_t, uint8_t>>>;
 struct CallTarget {
   uint32_t function_index;
   uint32_t call_frequency_percent;
@@ -665,9 +665,11 @@ struct CallTarget {
   }
 };
 using CallTargetVector = base::SmallVector<CallTarget, 4>;
-// Maps from function index and byte offset to a SmallVector of call targets.
-using CallTargets = std::unordered_map<std::pair<uint32_t, uint32_t>,
-                                       CallTargetVector, Uint32PairHash>;
+// Maps from function index to a vector of byte offset and a SmallVector of call
+// targets.
+using CallTargets =
+    std::unordered_map<uint32_t,
+                       std::vector<std::pair<uint32_t, CallTargetVector>>>;
 
 // Static representation of a module.
 struct V8_EXPORT_PRIVATE WasmModule {

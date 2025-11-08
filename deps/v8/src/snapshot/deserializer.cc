@@ -699,8 +699,9 @@ void Deserializer<IsolateT>::PostProcessNewObject(DirectHandle<Map> map,
     auto descriptors = Cast<DescriptorArray>(obj);
     new_descriptor_arrays_.Push(*descriptors);
   } else if (InstanceTypeChecker::IsNativeContext(instance_type)) {
-    Cast<NativeContext>(raw_obj)->init_microtask_queue(main_thread_isolate(),
-                                                       nullptr);
+    Tagged<NativeContext> context = Cast<NativeContext>(raw_obj);
+    context->init_microtask_queue(main_thread_isolate(), nullptr);
+    main_thread_isolate()->heap()->AddToWeakNativeContextList(context);
   } else if (InstanceTypeChecker::IsScript(instance_type)) {
     LogScriptEvents(Cast<Script>(*obj));
   }
@@ -1499,7 +1500,6 @@ template <typename IsolateT>
 template <typename SlotAccessor>
 int Deserializer<IsolateT>::ReadAllocateJSDispatchEntry(
     uint8_t data, SlotAccessor slot_accessor) {
-#ifdef V8_ENABLE_LEAPTIERING
   DCHECK_NE(slot_accessor.object()->address(), kNullAddress);
   DirectHandle<HeapObject> host = slot_accessor.object();
 
@@ -1522,16 +1522,12 @@ int Deserializer<IsolateT>::ReadAllocateJSDispatchEntry(
   JS_DISPATCH_HANDLE_WRITE_BARRIER(*host, handle);
 
   return 1;
-#else
-  UNREACHABLE();
-#endif  // V8_ENABLE_SANDBOX
 }
 
 template <typename IsolateT>
 template <typename SlotAccessor>
 int Deserializer<IsolateT>::ReadJSDispatchEntry(uint8_t data,
                                                 SlotAccessor slot_accessor) {
-#ifdef V8_ENABLE_LEAPTIERING
   DCHECK_NE(slot_accessor.object()->address(), kNullAddress);
   DirectHandle<HeapObject> host = slot_accessor.object();
   uint32_t entry_id = source_.GetUint30();
@@ -1549,9 +1545,6 @@ int Deserializer<IsolateT>::ReadJSDispatchEntry(uint8_t data,
   JS_DISPATCH_HANDLE_WRITE_BARRIER(*host, handle);
 
   return 1;
-#else
-  UNREACHABLE();
-#endif  // V8_ENABLE_SANDBOX
 }
 
 template <typename IsolateT>

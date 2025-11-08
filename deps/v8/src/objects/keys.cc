@@ -272,8 +272,8 @@ Maybe<bool> KeyAccumulator::CollectKeys(DirectHandle<JSReceiver> receiver,
       result = CollectOwnJSProxyKeys(receiver, Cast<JSProxy>(current));
     } else if (IsWasmObject(*current)) {
       if (mode_ == KeyCollectionMode::kIncludePrototypes) {
-        RETURN_FAILURE(isolate_, kThrowOnError,
-                       NewTypeError(MessageTemplate::kWasmObjectsAreOpaque));
+        // No keys to report, also no reason to stop iterating.
+        result = Just(true);
       } else {
         DCHECK_EQ(KeyCollectionMode::kOwnOnly, mode_);
         DCHECK_EQ(result, Just(false));  // Stop iterating.
@@ -688,7 +688,12 @@ MaybeHandle<FixedArray> FastKeyAccumulator::GetKeysWithPrototypeInfoCache(
 }
 
 bool FastKeyAccumulator::MayHaveElements(Tagged<JSReceiver> receiver) {
-  if (!IsJSObject(receiver)) return true;
+  if (!IsJSObject(receiver)) {
+#if V8_ENABLE_WEBASSEMBLY
+    if (IsWasmObject(*receiver)) return false;
+#endif  // V8_ENABLE_WEBASSEMBLY
+    return true;
+  }
   Tagged<JSObject> object = Cast<JSObject>(receiver);
   if (object->HasEnumerableElements()) return true;
   if (object->HasIndexedInterceptor()) return true;
@@ -698,6 +703,9 @@ bool FastKeyAccumulator::MayHaveElements(Tagged<JSReceiver> receiver) {
 bool FastKeyAccumulator::TryPrototypeInfoCache(
     DirectHandle<JSReceiver> receiver) {
   if (may_have_elements_ && !only_own_has_simple_elements_) return false;
+#if V8_ENABLE_WEBASSEMBLY
+  if (IsWasmObject(*receiver)) return false;
+#endif  // V8_ENABLE_WEBASSEMBLY
   DirectHandle<JSObject> object = Cast<JSObject>(receiver);
   if (!object->HasFastProperties()) return false;
   if (object->HasNamedInterceptor()) return false;

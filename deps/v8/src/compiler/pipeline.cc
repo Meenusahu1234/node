@@ -29,7 +29,6 @@
 #include "src/compiler/backend/instruction.h"
 #include "src/compiler/backend/register-allocator-verifier.h"
 #include "src/compiler/backend/register-allocator.h"
-#include "src/compiler/basic-block-instrumentor.h"
 #include "src/compiler/branch-elimination.h"
 #include "src/compiler/bytecode-graph-builder.h"
 #include "src/compiler/checkpoint-elimination.h"
@@ -2787,6 +2786,36 @@ MaybeHandle<Code> Pipeline::GenerateCodeForTurboshaftBuiltin(
   return turboshaft_pipeline.FinalizeCode();
 }
 
+MaybeHandle<Code> Pipeline::GenerateCodeForTesting(
+    turboshaft::PipelineData* turboshaft_data, CallDescriptor* call_descriptor,
+    const char* debug_name) {
+  Isolate* isolate = turboshaft_data->isolate();
+
+  PipelineJobScope scope(turboshaft_data,
+                         isolate->counters()->runtime_call_stats());
+  RCS_SCOPE(isolate, RuntimeCallCounterId::kOptimizeCode);
+
+  std::unique_ptr<TurbofanPipelineStatistics> pipeline_statistics(
+      CreatePipelineStatistics(Handle<Script>::null(), turboshaft_data->info(),
+                               isolate, turboshaft_data->zone_stats()));
+
+  turboshaft::BuiltinPipeline turboshaft_pipeline(turboshaft_data);
+  OptimizedCompilationInfo* info = turboshaft_data->info();
+  if (info->trace_turbo_graph() || info->trace_turbo_json()) {
+    turboshaft::ZoneWithName<turboshaft::kTempZoneName> print_zone(
+        turboshaft_data->zone_stats(), turboshaft::kTempZoneName);
+    std::string name_buffer = "Testing: ";
+    name_buffer += debug_name;
+    turboshaft_pipeline.PrintGraph(print_zone, name_buffer.c_str());
+  }
+
+  turboshaft_pipeline.OptimizeBuiltin();
+
+  Linkage linkage(call_descriptor);
+  CHECK(turboshaft_pipeline.GenerateCode(&linkage, {}, nullptr, nullptr, 0));
+  return turboshaft_pipeline.FinalizeCode();
+}
+
 #if V8_ENABLE_WEBASSEMBLY
 
 namespace {
@@ -3041,7 +3070,8 @@ base::OwnedVector<uint8_t> SerializeInliningPositions(
 // static
 wasm::WasmCompilationResult Pipeline::GenerateWasmCode(
     wasm::CompilationEnv* env, WasmCompilationData& compilation_data,
-    wasm::WasmDetectedFeatures* detected, Counters* counters) {
+    wasm::WasmDetectedFeatures* detected,
+    DelayedCounterUpdates* counter_updates) {
   auto* wasm_engine = wasm::GetWasmEngine();
   const wasm::WasmModule* module = env->module;
   base::TimeTicks start_time;
@@ -3198,16 +3228,6 @@ wasm::WasmCompilationResult Pipeline::GenerateWasmCode(
 
   if (v8_flags.wasm_opt && uses_wasm_gc_features) {
     CHECK(turboshaft_pipeline.Run<turboshaft::WasmGCOptimizePhase>());
-  } else {
-    // `has_wasm_type_cast_rtt_in_loop` needs to be initialized before the
-    // WasmLoweringPhase. If we reach this point, then either wasm_opt is
-    // disabled in which case it makes sense to skip the optimization it
-    // controls, or the graph doesn't use WasmGC features, in which case this
-    // optimization won't apply anyways. By just calling
-    // `initialize_has_wasm_type_cast_rtt_in_loop` and never calling
-    // `set_has_wasm_type_cast_rtt_in_loop`, we effectively disable the
-    // wasm_type_cast_rtt_in_loop optimization.
-    turboshaft_data.initialize_has_wasm_type_cast_rtt_in_loop();
   }
 
   // TODO(mliedtke): This phase could be merged with the WasmGCOptimizePhase
@@ -3223,13 +3243,6 @@ wasm::WasmCompilationResult Pipeline::GenerateWasmCode(
     CHECK(turboshaft_pipeline.Run<turboshaft::WasmOptimizePhase>());
   }
 
-#if V8_TARGET_ARCH_ARM64
-  if (v8_flags.experimental_wasm_simd_opt && v8_flags.wasm_opt &&
-      detected->has_simd()) {
-    CHECK(turboshaft_pipeline.Run<turboshaft::WasmSimdPhase>());
-  }
-#endif  // V8_TARGET_ARCH_ARM64
-
 #if DEBUG
   if (!v8_flags.wasm_opt) {
     // We still need to lower allocation operations even with optimizations
@@ -3243,6 +3256,13 @@ wasm::WasmCompilationResult Pipeline::GenerateWasmCode(
   }
 
   CHECK(turboshaft_pipeline.Run<turboshaft::WasmDeadCodeEliminationPhase>());
+
+#if V8_TARGET_ARCH_ARM64
+  if (v8_flags.experimental_wasm_simd_opt && v8_flags.wasm_opt &&
+      detected->has_simd()) {
+    CHECK(turboshaft_pipeline.Run<turboshaft::WasmSimdPhase>());
+  }
+#endif  // V8_TARGET_ARCH_ARM64
 
   if (V8_UNLIKELY(v8_flags.turboshaft_enable_debug_features)) {
     // This phase has to run very late to allow all previous phases to use
@@ -3273,6 +3293,7 @@ wasm::WasmCompilationResult Pipeline::GenerateWasmCode(
       code_generator->GetProtectedInstructionsData();
   result.deopt_data = code_generator->GenerateWasmDeoptimizationData();
   result.result_tier = wasm::ExecutionTier::kTurbofan;
+  result.effect_handlers = code_generator->GenerateWasmEffectHandler();
 
   if (data.info()->trace_turbo_json()) {
     TurboJsonFile json_of(data.info(), std::ios_base::app);
@@ -3320,9 +3341,10 @@ wasm::WasmCompilationResult Pipeline::GenerateWasmCode(
                    << std::endl;
   }
 
-  if (counters && compilation_data.body_size() >= 100 * KB) {
+  if (compilation_data.body_size() >= 100 * KB) {
     size_t zone_bytes = zone_stats.GetMaxAllocatedBytes();
-    counters->wasm_compile_huge_function_peak_memory_bytes()->AddSample(
+    counter_updates->AddSample(
+        &Counters::wasm_compile_huge_function_peak_memory_bytes,
         static_cast<int>(std::min(size_t{kMaxInt}, zone_bytes)));
   }
 
@@ -3330,7 +3352,7 @@ wasm::WasmCompilationResult Pipeline::GenerateWasmCode(
   // any deopt data. This indicates a baseline of how many functions can
   // potentially deopt, so that the statistics of having x functions that
   // deopted at least once becomes more meaningful.
-  if (counters && !result.deopt_data.empty()) {
+  if (!result.deopt_data.empty()) {
     DCHECK(v8_flags.wasm_deopt);
     bool is_first_tierup = false;
     {
@@ -3340,7 +3362,7 @@ wasm::WasmCompilationResult Pipeline::GenerateWasmCode(
           compilation_data.func_index);
     }
     if (is_first_tierup) {
-      counters->wasm_deopts_per_function()->AddSample(0);
+      counter_updates->AddSample(&Counters::wasm_deopts_per_function, 0);
     }
   }
 

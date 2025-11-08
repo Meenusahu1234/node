@@ -47,6 +47,10 @@
 #include "src/wasm/struct-types.h"
 #endif  // V8_ENABLE_WEBASSEMBLY
 
+#if V8_TARGET_ARCH_X64 || V8_TARGET_ARCH_ARM64
+#include "src/common/code-memory-access.h"
+#endif  // V8_TARGET_ARCH_X64 || V8_TARGET_ARCH_ARM64
+
 namespace v8 {
 namespace internal {
 
@@ -179,7 +183,7 @@ void IC::TraceIC(const char* type, DirectHandle<Object> name, State old_state,
 }
 
 IC::IC(Isolate* isolate, Handle<FeedbackVector> vector, FeedbackSlot slot,
-       FeedbackSlotKind kind)
+       FeedbackSlotKind kind, CallerFrameType caller_frame_type)
     : isolate_(isolate),
       vector_set_(false),
       kind_(kind),
@@ -190,6 +194,7 @@ IC::IC(Isolate* isolate, Handle<FeedbackVector> vector, FeedbackSlot slot,
   DCHECK_IMPLIES(!vector.is_null(), kind_ == nexus_.kind());
   state_ = (vector.is_null()) ? NO_FEEDBACK : nexus_.ic_state();
   old_state_ = state_;
+  caller_frame_type_ = caller_frame_type;
 }
 
 static void LookupForRead(LookupIterator* it, bool is_has_property) {
@@ -507,18 +512,6 @@ MaybeDirectHandle<Object> LoadGlobalIC::Load(Handle<Name> name,
 
 namespace {
 
-bool AddOneReceiverMapIfMissing(MapHandles* receiver_maps,
-                                Handle<Map> new_receiver_map) {
-  DCHECK(!new_receiver_map.is_null());
-  for (DirectHandle<Map> map : *receiver_maps) {
-    if (!map.is_null() && map.is_identical_to(new_receiver_map)) {
-      return false;
-    }
-  }
-  receiver_maps->push_back(new_receiver_map);
-  return true;
-}
-
 bool AddOneReceiverMapIfMissing(MapsAndHandlers* receiver_maps_and_handlers,
                                 Handle<Map> new_receiver_map) {
   DCHECK(!new_receiver_map.is_null());
@@ -713,6 +706,65 @@ bool IC::UpdatePolymorphicIC(DirectHandle<Name> name,
   return true;
 }
 
+#ifdef V8_ENABLE_SPARKPLUG_PLUS
+namespace {
+
+Builtin CalculatePatchingTarget(Builtin current_builtin, Builtin handler) {
+  static_assert(Builtin::kFirstLoadICHandler ==
+                Builtin::kLoadICUninitializedBaseline);
+  static_assert(Builtin::kLastLoadICHandler == Builtin::kLoadICGenericBaseline);
+  // Currently we only have LoadIC handlers. {current_builtin} should not be the
+  // generic handler because we should be able to return early in that case.
+  DCHECK(current_builtin >= Builtin::kFirstLoadICHandler &&
+         current_builtin < Builtin::kLastLoadICHandler);
+  DCHECK(handler > Builtin::kFirstLoadICHandler &&
+         handler <= Builtin::kLastLoadICHandler);
+  // No need to patch when the current and target handlers are the same.
+  if (current_builtin == handler) return Builtin::kNoBuiltinId;
+  // Uninitialized handler can be patch to any other handlers.
+  if (current_builtin == Builtin::kLoadICUninitializedBaseline) {
+    return handler;
+  }
+  // Other handlers are only allowed to be patched to a more generic handler.
+  return Builtin::kLoadICGenericBaseline;
+}
+
+}  // namespace
+#endif  // V8_ENABLE_SPARKPLUG_PLUS
+
+void IC::MaybePatchCode(Builtin handler) {
+  CHECK(v8_flags.sparkplug_plus);
+
+#ifdef V8_ENABLE_SPARKPLUG_PLUS
+  if (handler == Builtin::kIllegal) return;
+  if (!isolate()->is_short_builtin_calls_enabled()) return;
+
+  // Patch baseline code if it is from baseline frame.
+  if (caller_frame_type() == CallerFrameType::kBaseline) {
+    const Address entry = Isolate::c_entry_fp(isolate_->thread_local_top());
+    Address* pc_address =
+        reinterpret_cast<Address*>(entry + ExitFrameConstants::kCallerPCOffset);
+    Address pc =
+        StackFrame::ReadPC(pc_address) - Assembler::kCallTargetAddressOffset;
+
+    Address current = Assembler::target_address_at(pc, kNullAddress);
+    // TODO(chromium:429351411): Consider using a cache.
+    Builtin current_builtin =
+        OffHeapInstructionStream::TryLookupCode(isolate_, current);
+    DCHECK_EQ(current, Builtins::EntryOf(current_builtin, isolate_));
+    Builtin target_builtin = CalculatePatchingTarget(current_builtin, handler);
+    if (target_builtin == Builtin::kNoBuiltinId) return;
+
+    Address target = Builtins::EntryOf(target_builtin, isolate_);
+    WritableJitAllocation jit_allocation =
+        WritableJitAllocation::ForPatchableBaselineJIT(
+            pc, Assembler::kCallTargetAddressOffset);
+    Assembler::set_target_address_at(pc, kNullAddress, target, &jit_allocation,
+                                     FLUSH_ICACHE_IF_NEEDED);
+  }
+#endif  // V8_ENABLE_SPARKPLUG_PLUS
+}
+
 void IC::UpdateMonomorphicIC(const MaybeObjectDirectHandle& handler,
                              DirectHandle<Name> name) {
   DCHECK(IsHandler(*handler));
@@ -744,6 +796,20 @@ bool IC::IsTransitionOfMonomorphicTarget(Tagged<Map> source_map,
   return transitioned_map == target_map;
 }
 
+Builtin IC::GetHandlerPolymorphic() {
+  if (IsLoadIC()) {
+    return Builtin::kLoadICGenericBaseline;
+  }
+  return Builtin::kIllegal;
+}
+
+Builtin IC::GetHandlerMegamorphic() {
+  if (IsLoadIC()) {
+    return Builtin::kLoadICGenericBaseline;
+  }
+  return Builtin::kIllegal;
+}
+
 void IC::SetCache(DirectHandle<Name> name, Handle<Object> handler) {
   SetCache(name, MaybeObjectHandle(handler));
 }
@@ -755,9 +821,14 @@ void IC::SetCache(DirectHandle<Name> name, const MaybeObjectHandle& handler) {
   switch (state()) {
     case NO_FEEDBACK:
       UNREACHABLE();
-    case UNINITIALIZED:
+    case UNINITIALIZED: {
       UpdateMonomorphicIC(handler, name);
+      if (v8_flags.sparkplug_plus) {
+        Builtin ic_handler = FeedbackNexus::ic_handler(*handler, kind());
+        MaybePatchCode(ic_handler);
+      }
       break;
+    }
     case RECOMPUTE_HANDLER:
     case MONOMORPHIC:
       if (IsGlobalIC()) {
@@ -767,7 +838,12 @@ void IC::SetCache(DirectHandle<Name> name, const MaybeObjectHandle& handler) {
       if (UpdateOneMapManyNamesIC(name)) break;
       [[fallthrough]];
     case POLYMORPHIC:
-      if (UpdatePolymorphicIC(name, handler)) break;
+      if (UpdatePolymorphicIC(name, handler)) {
+        if (v8_flags.sparkplug_plus) {
+          MaybePatchCode(GetHandlerPolymorphic());
+        }
+        break;
+      }
       if (UpdateMegaDOMIC(handler, name)) break;
       if (!is_keyed() || state() == RECOMPUTE_HANDLER) {
         CopyICToMegamorphicCache(name);
@@ -778,6 +854,9 @@ void IC::SetCache(DirectHandle<Name> name, const MaybeObjectHandle& handler) {
       [[fallthrough]];
     case MEGAMORPHIC:
       UpdateMegamorphicCache(lookup_start_object_map(), name, handler);
+      if (v8_flags.sparkplug_plus) {
+        MaybePatchCode(GetHandlerMegamorphic());
+      }
       // Indicate that we've handled this case.
       vector_set_ = true;
       break;
@@ -1172,16 +1251,17 @@ void KeyedLoadIC::UpdateLoadElement(DirectHandle<HeapObject> receiver,
   Handle<Map> receiver_map(receiver->map(), isolate());
   DCHECK(receiver_map->instance_type() !=
          JS_PRIMITIVE_WRAPPER_TYPE);  // Checked by caller.
-  MapHandles target_receiver_maps(isolate());
-  TargetMaps(&target_receiver_maps);
 
-  if (target_receiver_maps.empty()) {
+  MapsAndHandlers target_maps_and_handlers(isolate());
+  nexus()->ExtractMapsAndHandlers(&target_maps_and_handlers);
+
+  if (target_maps_and_handlers.empty()) {
     DirectHandle<Object> handler =
         LoadElementHandler(receiver_map, new_load_mode);
     return ConfigureVectorState(DirectHandle<Name>(), receiver_map, handler);
   }
 
-  for (DirectHandle<Map> map : target_receiver_maps) {
+  for (DirectHandle<Map> map : target_maps_and_handlers.maps()) {
     if (map.is_null()) continue;
     if (map->instance_type() == JS_PRIMITIVE_WRAPPER_TYPE) {
       set_slow_stub_reason("JSPrimitiveWrapper");
@@ -1203,7 +1283,7 @@ void KeyedLoadIC::UpdateLoadElement(DirectHandle<HeapObject> receiver,
   if (state() == MONOMORPHIC) {
     if ((IsJSObject(*receiver) &&
          IsMoreGeneralElementsKindTransition(
-             target_receiver_maps.at(0)->elements_kind(),
+             target_maps_and_handlers[0].first->elements_kind(),
              Cast<JSObject>(receiver)->GetElementsKind())) ||
         IsWasmObject(*receiver)) {
       DirectHandle<Object> handler =
@@ -1217,7 +1297,7 @@ void KeyedLoadIC::UpdateLoadElement(DirectHandle<HeapObject> receiver,
   // Determine the list of receiver maps that this call site has seen,
   // adding the map that was just encountered.
   KeyedAccessLoadMode old_load_mode = KeyedAccessLoadMode::kInBounds;
-  if (!AddOneReceiverMapIfMissing(&target_receiver_maps, receiver_map)) {
+  if (!AddOneReceiverMapIfMissing(&target_maps_and_handlers, receiver_map)) {
     old_load_mode = GetKeyedAccessLoadModeFor(receiver_map);
     if (!AllowedHandlerChange(old_load_mode, new_load_mode)) {
       set_slow_stub_reason("same map added twice");
@@ -1227,29 +1307,29 @@ void KeyedLoadIC::UpdateLoadElement(DirectHandle<HeapObject> receiver,
 
   // If the maximum number of receiver maps has been exceeded, use the generic
   // version of the IC.
-  if (static_cast<int>(target_receiver_maps.size()) >
+  if (static_cast<int>(target_maps_and_handlers.size()) >
       v8_flags.max_valid_polymorphic_map_count) {
     set_slow_stub_reason("max polymorph exceeded");
     return;
   }
 
-  MaybeObjectHandles handlers;
-  handlers.reserve(target_receiver_maps.size());
+  MapsAndHandlers new_maps_and_handlers(isolate());
+  new_maps_and_handlers.reserve(target_maps_and_handlers.size());
   KeyedAccessLoadMode load_mode =
       GeneralizeKeyedAccessLoadMode(old_load_mode, new_load_mode);
-  LoadElementPolymorphicHandlers(&target_receiver_maps, &handlers, load_mode);
-  if (target_receiver_maps.empty()) {
+
+  // Update the polymorphic handlers with load_mode.
+  LoadElementPolymorphicHandlers(&target_maps_and_handlers,
+                                 &new_maps_and_handlers, load_mode);
+  if (new_maps_and_handlers.empty()) {
     DirectHandle<Object> handler =
         LoadElementHandler(receiver_map, new_load_mode);
     ConfigureVectorState(DirectHandle<Name>(), receiver_map, handler);
-  } else if (target_receiver_maps.size() == 1) {
-    ConfigureVectorState(DirectHandle<Name>(), target_receiver_maps[0],
-                         handlers[0]);
+  } else if (new_maps_and_handlers.size() == 1) {
+    ConfigureVectorState(DirectHandle<Name>(), new_maps_and_handlers[0].first,
+                         new_maps_and_handlers[0].second);
   } else {
-    ConfigureVectorState(DirectHandle<Name>(),
-                         MapHandlesSpan(target_receiver_maps.begin(),
-                                        target_receiver_maps.end()),
-                         &handlers);
+    ConfigureVectorState(DirectHandle<Name>(), new_maps_and_handlers);
   }
 }
 
@@ -1304,10 +1384,6 @@ bool IsOutOfBoundsAccess(DirectHandle<Object> receiver, size_t index) {
   return index >= length;
 }
 
-bool AllowReadingHoleElement(ElementsKind elements_kind) {
-  return IsHoleyElementsKind(elements_kind);
-}
-
 KeyedAccessLoadMode GetNewKeyedLoadMode(Isolate* isolate,
                                         DirectHandle<HeapObject> receiver,
                                         size_t index, bool is_found,
@@ -1351,7 +1427,7 @@ KeyedAccessLoadMode GetNewKeyedLoadMode(Isolate* isolate,
 
   // Read a hole.
   DCHECK(!is_found && !is_oob_access);
-  bool handle_hole = AllowReadingHoleElement(elements_kind);
+  bool handle_hole = IsHoleyElementsKind(elements_kind);
   DCHECK_IMPLIES(always_handle_holes, handle_hole);
   return handle_hole ? KeyedAccessLoadMode::kHandleHoles
                      : KeyedAccessLoadMode::kInBounds;
@@ -1359,6 +1435,7 @@ KeyedAccessLoadMode GetNewKeyedLoadMode(Isolate* isolate,
 
 KeyedAccessLoadMode GetUpdatedLoadModeForMap(Isolate* isolate,
                                              DirectHandle<Map> map,
+                                             KeyedAccessLoadMode old_load_mode,
                                              KeyedAccessLoadMode load_mode) {
   // If we are not allowed to convert a hole to undefined, then we should not
   // handle OOB nor reading holes.
@@ -1366,20 +1443,17 @@ KeyedAccessLoadMode GetUpdatedLoadModeForMap(Isolate* isolate,
     return KeyedAccessLoadMode::kInBounds;
   }
   // Check if the elements kind allow reading a hole.
-  bool allow_reading_hole_element =
-      AllowReadingHoleElement(map->elements_kind());
-  switch (load_mode) {
-    case KeyedAccessLoadMode::kInBounds:
-    case KeyedAccessLoadMode::kHandleOOB:
-      return load_mode;
-    case KeyedAccessLoadMode::kHandleHoles:
-      return allow_reading_hole_element ? KeyedAccessLoadMode::kHandleHoles
-                                        : KeyedAccessLoadMode::kInBounds;
-    case KeyedAccessLoadMode::kHandleOOBAndHoles:
-      return allow_reading_hole_element
-                 ? KeyedAccessLoadMode::kHandleOOBAndHoles
-                 : KeyedAccessLoadMode::kHandleOOB;
-  }
+  bool allow_reading_hole_element = IsHoleyElementsKind(map->elements_kind());
+
+  bool old_allow_oob = LoadModeHandlesOOB(old_load_mode);
+  bool old_allow_holes = LoadModeHandlesHoles(old_load_mode);
+  bool new_allow_oob = LoadModeHandlesOOB(load_mode);
+  bool new_allow_holes = LoadModeHandlesHoles(load_mode);
+
+  bool updated_allow_oob = old_allow_oob || new_allow_oob;
+  bool updated_allow_holes =
+      allow_reading_hole_element && (old_allow_holes || new_allow_holes);
+  return CreateKeyedAccessLoadMode(updated_allow_oob, updated_allow_holes);
 }
 
 }  // namespace
@@ -1437,7 +1511,7 @@ Handle<Object> KeyedLoadIC::LoadElementHandler(
          IsTypedArrayOrRabGsabTypedArrayElementsKind(elements_kind));
   DCHECK_IMPLIES(
       LoadModeHandlesHoles(new_load_mode),
-      AllowReadingHoleElement(elements_kind) &&
+      IsHoleyElementsKind(elements_kind) &&
           AllowConvertHoleElementToUndefined(isolate(), receiver_map));
   DirectHandle<Map> transition_target;
   if (is_js_array && maybe_transition_target.ToHandle(&transition_target)) {
@@ -1452,36 +1526,43 @@ Handle<Object> KeyedLoadIC::LoadElementHandler(
 }
 
 void KeyedLoadIC::LoadElementPolymorphicHandlers(
-    MapHandles* receiver_maps, MaybeObjectHandles* handlers,
-    KeyedAccessLoadMode new_load_mode) {
-  // Filter out deprecated maps to ensure their instances get migrated.
-  auto new_end = std::remove_if(
-      receiver_maps->begin(), receiver_maps->end(),
-      [](const DirectHandle<Map>& map) { return map->is_deprecated(); });
-  receiver_maps->erase(new_end, receiver_maps->end());
+    MapsAndHandlers* old_maps_and_handlers,
+    MapsAndHandlers* new_maps_and_handlers, KeyedAccessLoadMode new_load_mode) {
+  for (auto [old_map, maybe_old_handler] : *old_maps_and_handlers) {
+    // Filter out deprecated maps to ensure their instances get migrated.
+    if (old_map->is_deprecated()) continue;
 
-  for (DirectHandle<Map> receiver_map : *receiver_maps) {
-      Tagged<Map> tmap = receiver_map->FindElementsKindTransitionedMap(
-          isolate(),
-          MapHandlesSpan(receiver_maps->begin(), receiver_maps->end()),
-          ConcurrencyMode::kSynchronous);
-      if (!tmap.is_null()) {
-        // Mark all stable receiver maps that have elements kind transition map
-        // among receiver_maps as unstable because the ICs and the optimizing
-        // compilers may perform an elements kind transition for this kind of
-        // receivers.
-        if (receiver_map->is_stable()) {
-          receiver_map->NotifyLeafMapLayoutChange(isolate());
-        }
-        handlers->push_back(MaybeObjectHandle(LoadElementHandler(
-            receiver_map,
-            GetUpdatedLoadModeForMap(isolate(), receiver_map, new_load_mode),
-            handle(tmap, isolate()))));
-      } else {
-        handlers->push_back(MaybeObjectHandle(LoadElementHandler(
-            receiver_map,
-            GetUpdatedLoadModeForMap(isolate(), receiver_map, new_load_mode))));
+    KeyedAccessLoadMode old_load_mode = KeyedAccessLoadMode::kInBounds;
+    if (!maybe_old_handler.is_null()) {
+      old_load_mode = LoadHandler::GetKeyedAccessLoadMode(*maybe_old_handler);
+    }
+
+    Tagged<Map> tmap = old_map->FindElementsKindTransitionedMap(
+        isolate(),
+        MapHandlesSpan(old_maps_and_handlers->maps().begin(),
+                       old_maps_and_handlers->maps().end()),
+        ConcurrencyMode::kSynchronous);
+    if (!tmap.is_null()) {
+      // Mark all stable receiver maps that have elements kind transition map
+      // among receiver_maps as unstable because the ICs and the optimizing
+      // compilers may perform an elements kind transition for this kind of
+      // receivers.
+      if (old_map->is_stable()) {
+        old_map->NotifyLeafMapLayoutChange(isolate());
       }
+      new_maps_and_handlers->emplace_back(
+          old_map, MaybeObjectHandle(LoadElementHandler(
+                       old_map,
+                       GetUpdatedLoadModeForMap(isolate(), old_map,
+                                                old_load_mode, new_load_mode),
+                       handle(tmap, isolate()))));
+    } else {
+      new_maps_and_handlers->emplace_back(
+          old_map,
+          MaybeObjectHandle(LoadElementHandler(
+              old_map, GetUpdatedLoadModeForMap(
+                           isolate(), old_map, old_load_mode, new_load_mode))));
+    }
   }
 }
 
@@ -2826,6 +2907,72 @@ RUNTIME_FUNCTION(Runtime_LoadIC_Miss) {
     ic.UpdateState(receiver, key);
     RETURN_RESULT_OR_FAILURE(isolate, ic.Load(receiver, key));
   }
+}
+
+RUNTIME_FUNCTION(Runtime_LoadIC_Miss_FromBaseline) {
+  HandleScope scope(isolate);
+  DCHECK_EQ(4, args.length());
+  // Runtime functions don't follow the IC's calling convention.
+  Handle<JSAny> receiver = args.at<JSAny>(0);
+  Handle<Name> key = args.at<Name>(1);
+  int slot = args.tagged_index_value_at(2);
+  Handle<FeedbackVector> vector = args.at<FeedbackVector>(3);
+  FeedbackSlot vector_slot = FeedbackVector::ToSlot(slot);
+
+  FeedbackSlotKind kind = vector->GetKind(vector_slot);
+  DCHECK(IsLoadICKind(kind));
+  LoadIC ic(isolate, vector, vector_slot, kind, CallerFrameType::kBaseline);
+  ic.UpdateState(receiver, key);
+  RETURN_RESULT_OR_FAILURE(isolate, ic.Load(receiver, key));
+}
+
+RUNTIME_FUNCTION(Runtime_PatchLoadICUninitializedBaseline) {
+#ifdef V8_ENABLE_SPARKPLUG_PLUS
+  DCHECK(v8_flags.sparkplug_plus);
+  HandleScope scope(isolate);
+  DCHECK_EQ(4, args.length());
+  // Runtime functions don't follow the IC's calling convention.
+  Handle<JSAny> receiver = args.at<JSAny>(0);
+  Handle<Name> key = args.at<Name>(1);
+  int slot = args.tagged_index_value_at(2);
+  Handle<FeedbackVector> vector = args.at<FeedbackVector>(3);
+  FeedbackSlot vector_slot = FeedbackVector::ToSlot(slot);
+  FeedbackSlotKind kind = vector->GetKind(vector_slot);
+
+  // Get target builtin's address.
+  FeedbackNexus nexus(isolate, vector, vector_slot);
+  Builtin target_builtin = nexus.ic_handler();
+  DCHECK(target_builtin > Builtin::kFirstLoadICHandler &&
+         target_builtin <= Builtin::kLastLoadICHandler);
+  Address target = Builtins::EntryOf(target_builtin, isolate);
+
+  {
+    // Get Caller's pc.
+    const Address entry = Isolate::c_entry_fp(isolate->thread_local_top());
+    Address* pc_address =
+        reinterpret_cast<Address*>(entry + ExitFrameConstants::kCallerPCOffset);
+    Address pc =
+        StackFrame::ReadPC(pc_address) - Assembler::kCallTargetAddressOffset;
+    DCHECK_EQ(
+        Assembler::target_address_at(pc, kNullAddress),
+        Builtins::EntryOf(Builtin::kLoadICUninitializedBaseline, isolate));
+    // Patch caller to the target address.
+    WritableJitAllocation jit_allocation =
+        WritableJitAllocation::ForPatchableBaselineJIT(
+            pc, Assembler::kCallTargetAddressOffset);
+    Assembler::set_target_address_at(pc, kNullAddress, target, &jit_allocation,
+                                     FLUSH_ICACHE_IF_NEEDED);
+  }
+
+  // TODO(chromium:429351411): LoadIC as NO_FEEDBACK. This will go down the slow
+  // path and might fail to update the feedback. However, in the future we would
+  // like to directly generate a call to the handler and then it will be less
+  // likely to go to this path.
+  LoadIC ic(isolate, Handle<FeedbackVector>(), vector_slot, kind);
+  RETURN_RESULT_OR_FAILURE(isolate, ic.Load(receiver, key));
+#else
+  UNREACHABLE();
+#endif  // V8_ENABLE_SPARKPLUG_PLUS
 }
 
 RUNTIME_FUNCTION(Runtime_LoadNoFeedbackIC_Miss) {

@@ -34,7 +34,8 @@ void SealCurrentObjects(Heap* heap) {
   CHECK(!v8_flags.stress_concurrent_allocation);
   heap::InvokeMajorGC(heap);
   heap::InvokeMajorGC(heap);
-  heap->EnsureSweepingCompleted(Heap::SweepingForcedFinalizationMode::kV8Only);
+  heap->EnsureSweepingCompleted(Heap::SweepingForcedFinalizationMode::kV8Only,
+                                CompleteSweepingReason::kTesting);
   heap->FreeMainThreadLinearAllocationAreas();
   for (PageMetadata* page : *heap->old_space()) {
     page->MarkNeverAllocateForTesting();
@@ -241,7 +242,8 @@ void FillCurrentPage(v8::internal::NewSpace* space,
     if (top == kNullAddress) return;
     PageMetadata* page = PageMetadata::FromAllocationAreaAddress(top);
     space->heap()->EnsureSweepingCompleted(
-        Heap::SweepingForcedFinalizationMode::kV8Only);
+        Heap::SweepingForcedFinalizationMode::kV8Only,
+        CompleteSweepingReason::kTesting);
     FillPageInPagedSpace(page, out_handles);
     space->heap()->FreeMainThreadLinearAllocationAreas();
   } else {
@@ -276,8 +278,8 @@ void SimulateIncrementalMarking(i::Heap* heap, bool force_completion) {
 
   if (heap->sweeping_in_progress()) {
     IsolateSafepointScope scope(heap);
-    heap->EnsureSweepingCompleted(
-        Heap::SweepingForcedFinalizationMode::kV8Only);
+    heap->EnsureSweepingCompleted(Heap::SweepingForcedFinalizationMode::kV8Only,
+                                  CompleteSweepingReason::kTesting);
   }
 
   if (marking->IsMinorMarking()) {
@@ -295,7 +297,7 @@ void SimulateIncrementalMarking(i::Heap* heap, bool force_completion) {
   CHECK(marking->IsMarking());
   if (!force_completion) return;
 
-  IsolateSafepointScope scope(heap);
+  SafepointScope scope(heap->isolate(), kGlobalSafepointForSharedSpaceIsolate);
   MarkingBarrier::PublishAll(heap);
   marking->MarkRootsForTesting();
 
@@ -306,7 +308,8 @@ void SimulateIncrementalMarking(i::Heap* heap, bool force_completion) {
 
 void SimulateFullSpace(v8::internal::PagedSpace* space) {
   Heap* heap = space->heap();
-  IsolateSafepointScope safepoint_scope(heap);
+  SafepointScope safepoint_scope(heap->isolate(),
+                                 kGlobalSafepointForSharedSpaceIsolate);
   heap->FreeLinearAllocationAreas();
 
   // If you see this check failing, disable the flag at the start of your test:
@@ -315,14 +318,16 @@ void SimulateFullSpace(v8::internal::PagedSpace* space) {
   CHECK(!v8_flags.stress_concurrent_allocation);
   if (space->heap()->sweeping_in_progress()) {
     space->heap()->EnsureSweepingCompleted(
-        Heap::SweepingForcedFinalizationMode::kV8Only);
+        Heap::SweepingForcedFinalizationMode::kV8Only,
+        CompleteSweepingReason::kTesting);
   }
   space->ResetFreeList();
 }
 
 void AbandonCurrentlyFreeMemory(PagedSpace* space) {
   Heap* heap = space->heap();
-  IsolateSafepointScope safepoint_scope(heap);
+  SafepointScope safepoint_scope(heap->isolate(),
+                                 kGlobalSafepointForSharedSpaceIsolate);
   heap->FreeLinearAllocationAreas();
 
   for (PageMetadata* page : *space) {
@@ -347,7 +352,8 @@ void InvokeAtomicMajorGC(Heap* heap) {
                                  GarbageCollectionReason::kTesting);
   if (heap->sweeping_in_progress()) {
     heap->EnsureSweepingCompleted(
-        Heap::SweepingForcedFinalizationMode::kUnifiedHeap);
+        Heap::SweepingForcedFinalizationMode::kUnifiedHeap,
+        CompleteSweepingReason::kTesting);
   }
 }
 
@@ -355,7 +361,8 @@ void InvokeAtomicMinorGC(Heap* heap) {
   InvokeMinorGC(heap);
   if (heap->sweeping_in_progress()) {
     heap->EnsureSweepingCompleted(
-        Heap::SweepingForcedFinalizationMode::kUnifiedHeap);
+        Heap::SweepingForcedFinalizationMode::kUnifiedHeap,
+        CompleteSweepingReason::kTesting);
   }
 }
 

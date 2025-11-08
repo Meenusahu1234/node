@@ -81,6 +81,14 @@ enum YoungGenerationSpeedMode {
                GCTracer::Scope::Name(GCTracer::Scope::ScopeId(scope_id)), \
                "epoch", tracer->CurrentEpoch(scope_id))
 
+#define TRACE_GC_EPOCH_ARG1(tracer, scope_id, thread_kind, arg_name,      \
+                            arg_value)                                    \
+  GCTracer::Scope UNIQUE_IDENTIFIER(gc_tracer_scope)(                     \
+      tracer, GCTracer::Scope::ScopeId(scope_id), thread_kind);           \
+  TRACE_EVENT2(TRACE_GC_CATEGORIES,                                       \
+               GCTracer::Scope::Name(GCTracer::Scope::ScopeId(scope_id)), \
+               "epoch", tracer->CurrentEpoch(scope_id), arg_name, arg_value)
+
 #define TRACE_GC_EPOCH_WITH_FLOW(tracer, scope_id, thread_kind, bind_id,  \
                                  flow_flags)                              \
   GCTracer::Scope UNIQUE_IDENTIFIER(gc_tracer_scope)(                     \
@@ -625,9 +633,9 @@ class V8_EXPORT_PRIVATE GCTracer {
   mutable base::Mutex background_scopes_mutex_;
   base::TimeDelta background_scopes_[Scope::NUMBER_OF_SCOPES];
 
-#if defined(V8_USE_PERFETTO)
   perfetto::NamedTrack parent_track_;
-#endif
+  perfetto::NamedTrack phase_track_;
+  perfetto::NamedTrack state_track_;
 
   FRIEND_TEST(GCTracerTest, AllocationThroughput);
   FRIEND_TEST(GCTracerTest, BackgroundScavengerScope);

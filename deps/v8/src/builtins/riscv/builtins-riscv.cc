@@ -509,7 +509,7 @@ void Builtins::Generate_ResumeGeneratorTrampoline(MacroAssembler* masm) {
   Register argc = kJavaScriptCallArgCountRegister;
   // Compute actual arguments count value as a formal parameter count without
   // receiver, loaded from the dispatch table entry or shared function info.
-#if V8_ENABLE_LEAPTIERING && V8_TARGET_ARCH_RISCV64
+#if V8_TARGET_ARCH_RISCV64
   Register dispatch_handle = kJavaScriptCallDispatchHandleRegister;
   Register code = kJavaScriptCallCodeStartRegister;  // a2
   Register scratch = t2;
@@ -532,7 +532,7 @@ void Builtins::Generate_ResumeGeneratorTrampoline(MacroAssembler* masm) {
   // Generator functions are always created from user code and thus the
   // formal parameter count is never equal to kDontAdaptArgumentsSentinel,
   // which is used only for certain non-generator builtin functions.
-#endif  // V8_ENABLE_LEAPTIERING
+#endif  // V8_TARGET_ARCH_RISCV64
   // ----------- S t a t e -------------
   //  -- a0    : actual arguments count
   //  -- a1    : the JSGeneratorObject to resume
@@ -592,13 +592,13 @@ void Builtins::Generate_ResumeGeneratorTrampoline(MacroAssembler* masm) {
     // undefined because generator functions are non-constructable.
     __ Move(a3, a1);  // new.target
     __ Move(a1, a5);  // target
-#if V8_ENABLE_LEAPTIERING && V8_TARGET_ARCH_RISCV64
+#if V8_TARGET_ARCH_RISCV64
     // Actual arguments count and code start are already initialized above.
     __ Jump(code);
 #else
     // Actual arguments count is already initialized above.
     __ JumpJSFunction(a1);
-#endif  // V8_ENABLE_LEAPTIERING
+#endif  // V8_TARGET_ARCH_RISCV64
   }
 
   __ bind(&prepare_step_in_if_stepping);
@@ -1139,13 +1139,6 @@ void Builtins::Generate_BaselineOutOfLinePrologue(MacroAssembler* masm) {
     __ AssertFeedbackVector(feedback_vector, type);
   }
 
-#ifndef V8_ENABLE_LEAPTIERING
-  // Check for an tiering state.
-  Label flags_need_processing;
-  Register flags = temps.Acquire();
-  __ LoadFeedbackVectorFlagsAndJumpIfNeedsProcessing(
-      flags, feedback_vector, CodeKind::BASELINE, &flags_need_processing);
-#endif  // !V8_ENABLE_LEAPTIERING
 
   {
     UseScratchRegisterScope temps(masm);
@@ -1221,16 +1214,6 @@ void Builtins::Generate_BaselineOutOfLinePrologue(MacroAssembler* masm) {
   // TODO(v8:11429): Document this frame setup better.
   __ Ret();
 
-#ifndef V8_ENABLE_LEAPTIERING
-  __ bind(&flags_need_processing);
-  {
-    ASM_CODE_COMMENT_STRING(masm, "Optimized marker check");
-    // Drop the frame created by the baseline call.
-    __ Pop(ra, fp);
-    __ OptimizeCodeOrTailCallOptimizedCodeSlot(flags, feedback_vector);
-    __ Trap();
-  }
-#endif  // !V8_ENABLE_LEAPTIERING
 
   __ bind(&call_stack_guard);
   {
@@ -1345,18 +1328,6 @@ void Builtins::Generate_InterpreterEntryTrampoline(
   __ LoadFeedbackVector(feedback_vector, closure, scratch, &push_stack_frame);
 
 #ifndef V8_JITLESS
-#ifndef V8_ENABLE_LEAPTIERING
-  // If feedback vector is valid, check for optimized code and update invocation
-  // count.
-
-  // Check the tiering state.
-  Label flags_need_processing;
-  DEFINE_PINNED(flags, a6);
-  __ LoadFeedbackVectorFlagsAndJumpIfNeedsProcessing(
-      flags, feedback_vector, CodeKind::INTERPRETED_FUNCTION,
-      &flags_need_processing);
-  FREE_REG(flags);
-#endif  // V8_ENABLE_LEAPTIERING
   ResetFeedbackVectorOsrUrgency(masm, feedback_vector, a4);
 
   // Increment invocation count for the function.
@@ -1523,46 +1494,8 @@ void Builtins::Generate_InterpreterEntryTrampoline(
   __ Branch(&after_stack_check_interrupt);
 
 #ifndef V8_JITLESS
-#ifndef V8_ENABLE_LEAPTIERING
-  __ bind(&flags_need_processing);
-  __ OptimizeCodeOrTailCallOptimizedCodeSlot(flags, feedback_vector);
-#endif  // !V8_ENABLE_LEAPTIERING
   __ bind(&is_baseline);
   {
-#ifndef V8_ENABLE_LEAPTIERING
-    // Load the feedback vector from the closure.
-    __ LoadTaggedField(
-        feedback_vector,
-        FieldMemOperand(closure, JSFunction::kFeedbackCellOffset));
-    __ LoadTaggedField(
-        feedback_vector,
-        FieldMemOperand(feedback_vector, FeedbackCell::kValueOffset));
-
-    Label install_baseline_code;
-    // Check if feedback vector is valid. If not, call prepare for baseline to
-    // allocate it.
-    __ LoadTaggedField(
-        scratch, FieldMemOperand(feedback_vector, HeapObject::kMapOffset));
-    __ Lhu(scratch, FieldMemOperand(scratch, Map::kInstanceTypeOffset));
-    __ Branch(&install_baseline_code, ne, scratch,
-              Operand(FEEDBACK_VECTOR_TYPE));
-
-    // Check for an tiering state.
-    __ LoadFeedbackVectorFlagsAndJumpIfNeedsProcessing(
-        flags, feedback_vector, CodeKind::BASELINE, &flags_need_processing);
-
-    // TODO(olivf, 42204201): This fastcase is difficult to support with the
-    // sandbox as it requires getting write access to the dispatch table. See
-    // `JSFunction::UpdateCode`. We might want to remove it for all
-    // configurations as it does not seem to be performance sensitive.
-    // Load the baseline code into the closure.
-    __ Move(a2, bytecode_array);
-    static_assert(kJavaScriptCallCodeStartRegister == a2, "ABI mismatch");
-    __ ReplaceClosureCodeWithOptimizedCode(a2, closure);
-    __ JumpCodeObject(a2, kJSEntrypointTag);
-
-    __ bind(&install_baseline_code);
-#endif  // !V8_ENABLE_LEAPTIERING
     __ GenerateTailCallToReturnedCode(Runtime::kInstallBaselineCode);
   }
 #endif  // !V8_JITLESS
@@ -2902,7 +2835,7 @@ void Builtins::Generate_CallFunction(MacroAssembler* masm,
   //  -- a2 : the shared function info.
   //  -- cp : the function context.
   // -----------------------------------
-#if defined(V8_ENABLE_LEAPTIERING) && defined(V8_TARGET_ARCH_RISCV64)
+#if defined(V8_TARGET_ARCH_RISCV64)
   __ InvokeFunctionCode(a1, no_reg, a0, InvokeType::kJump);
 #else
   __ Lhu(a2,
@@ -3188,7 +3121,10 @@ static void SaveVectorRegisters(MacroAssembler* masm,
   // Check if the machine has simd128 support. Otherwise, the
   // vector registers might not exist and accessing them would SIGILL.
   Label done;
+
+  ASM_CODE_COMMENT(masm);
   __ li(kScratchReg, ExternalReference::supports_wasm_simd_128_address());
+  __ Lb(kScratchReg, MemOperand(kScratchReg, 0));
   // If != 0, then simd is available.
   __ Branch(&done, eq, kScratchReg, Operand(zero_reg), Label::Distance::kNear);
 
@@ -3210,7 +3146,9 @@ static void RestoreVectorRegisters(MacroAssembler* masm,
   // Check if the machine has simd128 support. Otherwise, the
   // vector registers might not exist and accessing them would SIGILL.
   Label done;
+  ASM_CODE_COMMENT(masm);
   __ li(kScratchReg, ExternalReference::supports_wasm_simd_128_address());
+  __ Lb(kScratchReg, MemOperand(kScratchReg, 0));
   // If != 0, then simd is available.
   __ Branch(&done, eq, kScratchReg, Operand(zero_reg), Label::Distance::kNear);
 
@@ -3269,6 +3207,18 @@ void Builtins::Generate_WasmLiftoffFrameSetup(MacroAssembler* masm) {
                      FieldMemOperand(vector, OFFSET_OF_DATA_START(FixedArray)));
   __ JumpIfSmi(vector, &allocate_vector);
   __ bind(&done);
+
+  // Increment the total invocation count of the function.
+  __ LoadTaggedField(scratch,
+                     FieldMemOperand(vector, OFFSET_OF_DATA_START(FixedArray)));
+  if (SmiValuesAre31Bits()) {
+    __ Add32(scratch, scratch, Operand(Smi::FromInt(1)));
+  } else {
+    __ AddWord(scratch, scratch, Operand(Smi::FromInt(1)));
+  }
+  __ StoreTaggedField(
+      scratch, FieldMemOperand(vector, OFFSET_OF_DATA_START(FixedArray)));
+
   __ Push(vector);
   __ Ret();
 
@@ -3380,7 +3330,7 @@ void SwitchToTheCentralStackIfNeeded(MacroAssembler* masm, Register argc_input,
                                      Register argv_input) {
   using ER = ExternalReference;
 
-  __ li(kSwitchFlagRegister, 0);
+  __ mv(kSwitchFlagRegister, zero_reg);
   __ mv(kOldSPRegister, sp);
 
   // Using x2-x4 as temporary registers, because they will be rewritten
@@ -4092,6 +4042,44 @@ void Builtins::Generate_WasmFXResume(MacroAssembler* masm) {
   LoadJumpBuffer(masm, target_stack, true, scratch);
   __ Trap();
   __ bind(&suspend);
+  __ LeaveFrame(StackFrame::WASM_STACK_EXIT);
+  __ Ret();
+}
+
+void Builtins::Generate_WasmFXSuspend(MacroAssembler* masm) {
+  __ EnterFrame(StackFrame::WASM_STACK_EXIT);
+  auto regs = RegisterAllocator::WithAllocatableGeneralRegisters();
+  DEFINE_REG(scratch);
+  Register tag = WasmFXSuspendDescriptor::GetRegisterParameter(0);
+  Register cont = WasmFXSuspendDescriptor::GetRegisterParameter(1);
+  Label resume;
+  __ Push(cont, kContextRegister);
+  {
+    FrameScope scope(masm, StackFrame::MANUAL);
+    __ PrepareCallCFunction(6, scratch);
+    __ Move(kCArgRegs[4], tag);
+    __ Move(kCArgRegs[5], cont);
+    __ li(kCArgRegs[0], ExternalReference::isolate_address());
+    __ Move(kCArgRegs[1], sp);
+    __ Move(kCArgRegs[2], fp);
+    __ LoadAddress(kCArgRegs[3], &resume);
+    __ CallCFunction(ExternalReference::wasm_suspend_wasmfx_stack(), 6);
+  }
+  Register target_stack = kReturnRegister1;
+  __ Move(target_stack, kReturnRegister0);
+  cont = kReturnRegister0;
+  __ Pop(cont, kContextRegister);
+
+  Label ok;
+  __ Branch(&ok, ne, target_stack, Operand(zero_reg));
+  // No handler found.
+  __ CallRuntime(Runtime::kThrowWasmSuspendError);
+
+  __ bind(&ok);
+  DCHECK_EQ(cont, kReturnRegister0);
+  LoadJumpBuffer(masm, target_stack, true, scratch);
+  __ Trap();
+  __ bind(&resume);
   __ LeaveFrame(StackFrame::WASM_STACK_EXIT);
   __ Ret();
 }
@@ -4834,7 +4822,8 @@ void Generate_DeoptimizationEntry(MacroAssembler* masm,
   __ SubWord(sp, sp, kNumberOfRegisters * kSystemPointerSize);
   for (int16_t i = kNumberOfRegisters - 1; i >= 0; i--) {
     if ((saved_regs.bits() & (1 << i)) != 0) {
-      __ StoreWord(ToRegister(i), MemOperand(sp, kSystemPointerSize * i));
+      __ StoreWord(Register::from_code(i),
+                   MemOperand(sp, kSystemPointerSize * i));
     }
   }
 
@@ -4991,7 +4980,7 @@ void Generate_DeoptimizationEntry(MacroAssembler* masm,
     int offset =
         (i * kSystemPointerSize) + FrameDescription::registers_offset();
     if ((restored_regs.bits() & (1 << i)) != 0) {
-      __ LoadWord(ToRegister(i), MemOperand(t3, offset));
+      __ LoadWord(Register::from_code(i), MemOperand(t3, offset));
     }
   }
 
@@ -5198,7 +5187,7 @@ void Builtins::Generate_RestartFrameTrampoline(MacroAssembler* masm) {
   // Pop return address and frame.
   __ LeaveFrame(StackFrame::INTERPRETED);
 
-#if defined(V8_ENABLE_LEAPTIERING) && defined(V8_TARGET_ARCH_RISCV64)
+#if defined(V8_TARGET_ARCH_RISCV64)
   __ InvokeFunction(a1, a0, InvokeType::kJump,
                     ArgumentAdaptionMode::kDontAdapt);
 #else

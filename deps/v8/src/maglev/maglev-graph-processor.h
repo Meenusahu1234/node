@@ -48,7 +48,8 @@ class GraphBackwardProcessor;
 
 enum class BlockProcessResult {
   kContinue,  // Process exited normally.
-  kSkip,      // Skip processing this block (no MultiProcessor support).
+  kSkip,      // Skip processing this blockand and do not call the following
+              // processors.
 };
 
 enum class ProcessResult {
@@ -136,16 +137,20 @@ class GraphProcessor {
         }
       }
     };
+    // LINT.IfChange(maglev_constant_nodes)
     process_constants(graph->constants());
     process_constants(graph->root());
     process_constants(graph->smi());
     process_constants(graph->tagged_index());
     process_constants(graph->int32());
     process_constants(graph->uint32());
+    process_constants(graph->shifted_int53());
     process_constants(graph->intptr());
     process_constants(graph->float64());
+    process_constants(graph->holey_float64());
     process_constants(graph->heap_number());
     process_constants(graph->trusted_constants());
+    // LINT.ThenChange()
 
     for (block_it_ = graph->begin(); block_it_ != graph->end(); ++block_it_) {
       bool process_control_block = true;
@@ -384,6 +389,7 @@ class GraphBackwardProcessor {
     process_constants(graph->tagged_index());
     process_constants(graph->int32());
     process_constants(graph->uint32());
+    process_constants(graph->shifted_int53());
     process_constants(graph->intptr());
     process_constants(graph->float64());
     process_constants(graph->heap_number());

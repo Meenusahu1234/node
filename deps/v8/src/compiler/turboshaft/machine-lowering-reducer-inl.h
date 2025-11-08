@@ -62,9 +62,10 @@ class MachineLoweringReducer : public Next {
     }
   }
 
-  V<Word32> REDUCE(Word32SignHint)(V<Word32> input, Word32SignHintOp::Sign) {
-    // As far as Machine operations are concerned, Int32 and Uint32 are both
-    // Word32.
+  V<Float64OrWord32> REDUCE(TypeHint)(V<Float64OrWord32> input,
+                                      TypeHintOp::Type) {
+    // As far as Machine operations are concerned, Int32/Uint32 are both Word32,
+    // and Float64/HoleyFloat64 are both Float64.
     return input;
   }
 
@@ -1307,7 +1308,6 @@ class MachineLoweringReducer : public Next {
           return result;
         }
       }
-#ifdef V8_ENABLE_UNDEFINED_DOUBLE
       case ConvertJSPrimitiveToUntaggedOp::UntaggedKind::kHoleyFloat64: {
         DCHECK_EQ(
             input_assumptions,
@@ -1319,9 +1319,12 @@ class MachineLoweringReducer : public Next {
                __ ChangeInt32ToFloat64(__ UntagSmi(V<Smi>::Cast(object))));
         } ELSE {
           V<Map> map = __ LoadMapField(V<HeapObject>::Cast(object));
+
+#ifdef V8_ENABLE_UNDEFINED_DOUBLE
           GOTO_IF(
               __ TaggedEqual(map, __ HeapConstant(factory_->undefined_map())),
               done, UndefinedNan());
+#endif  // V8_ENABLE_UNDEFINED_DOUBLE
           IF (UNLIKELY(
                   __ TaggedEqual(map, __ HeapConstant(factory_->hole_map())))) {
             __ Unreachable();
@@ -1336,7 +1339,6 @@ class MachineLoweringReducer : public Next {
         BIND(done, result);
         return result;
       }
-#endif  // V8_ENABLE_UNDEFINED_DOUBLE
     }
     UNREACHABLE();
   }
@@ -1690,6 +1692,23 @@ class MachineLoweringReducer : public Next {
                   done, 0);
         }
 #endif
+
+#if V8_STATIC_ROOTS_BOOL
+        if (v8_flags.unmap_holes && !v8_flags.turbolev) {
+          // TruncateJSPrimitiveToUntagged(Object -> Bit) is pure in Turbofan,
+          // and can thus float above hole checks. This will lead to either
+          // segfaulting at runtime because we try to read the map of the hole
+          // (or straight up int3 if MachineOptimizationReducer tries to
+          // constant-fold the map load from the hole and inserts an
+          // Unreachable). We thus do a hole check here to avoid this kind of
+          // issues.
+          IF (SafeIsAnyHole(V<HeapObject>::Cast(object))) {
+            GOTO(done, 0);
+          }
+        }
+#else
+        DCHECK(!v8_flags.unmap_holes);
+#endif  // V8_STATIC_ROOTS_BOOL
 
         // Load the map of {object}.
         V<Map> map = __ LoadMapField(object);
@@ -2361,8 +2380,8 @@ class MachineLoweringReducer : public Next {
         // Check for exception sentinel: Smi 1 is returned to signal
         // TerminationRequested.
         IF (UNLIKELY(__ TaggedEqual(result, __ TagSmi(1)))) {
-          __ CallRuntime_TerminateExecution(isolate_, frame_state,
-                                            __ NoContextConstant());
+          __ template CallRuntime<runtime::TerminateExecution>(
+              frame_state, __ NoContextConstant(), {}, LazyDeoptOnThrow::kNo);
         }
 
         // Check for exception sentinel: Smi 0 is returned to signal
@@ -2587,10 +2606,11 @@ class MachineLoweringReducer : public Next {
         }
 
         if (BIND(runtime)) {
-          V<Word32> value =
-              __ UntagSmi(V<Smi>::Cast(__ CallRuntime_StringCharCodeAt(
-                  isolate_, __ NoContextConstant(), receiver,
-                  __ TagSmi(__ TruncateWordPtrToWord32(position)))));
+          V<Word32> value = __ UntagSmi(
+              V<Smi>::Cast(__ template CallRuntime<runtime::StringCharCodeAt>(
+                  __ NoContextConstant(),
+                  {.string = receiver,
+                   .index = __ TagSmi(__ TruncateWordPtrToWord32(position))})));
           GOTO(done, value);
         }
       }
@@ -2643,8 +2663,8 @@ class MachineLoweringReducer : public Next {
           __ NoContextConstant(), {.string = string});
     } else {
       DCHECK_EQ(kind, StringToCaseIntlOp::Kind::kUpper);
-      return __ CallRuntime_StringToUpperCaseIntl(
-          isolate_, __ NoContextConstant(), string);
+      return __ template CallRuntime<runtime::StringToUpperCaseIntl>(
+          __ NoContextConstant(), {.string = string});
     }
   }
 #endif  // V8_INTL_SUPPORT
@@ -2797,7 +2817,7 @@ class MachineLoweringReducer : public Next {
 
   V<Object> REDUCE(LoadStackArgument)(V<WordPtr> base, V<WordPtr> index) {
     // Note that this is a load of a Tagged value
-    // (MemoryRepresentation::TaggedPointer()), but since it's on the stack
+    // (MemoryRepresentation::AnyTagged()), but since it's on the stack
     // where stack slots are all kSystemPointerSize, we use kSystemPointerSize
     // for element_size_log2. On 64-bit plateforms with pointer compression,
     // this means that we're kinda loading a 32-bit value from an array of
@@ -2810,7 +2830,7 @@ class MachineLoweringReducer : public Next {
         CommonFrameConstants::kFixedFrameSizeAboveFp - kSystemPointerSize;
 #endif
     return __ Load(base, index, LoadOp::Kind::RawAligned(),
-                   MemoryRepresentation::TaggedPointer(), offset,
+                   MemoryRepresentation::AnyTagged(), offset,
                    kSystemPointerSizeLog2);
   }
 
@@ -3471,8 +3491,13 @@ class MachineLoweringReducer : public Next {
   }
 
   V<None> REDUCE(RuntimeAbort)(AbortReason reason) {
-    __ CallRuntime_Abort(isolate_, __ NoContextConstant(),
-                         __ TagSmi(static_cast<int>(reason)));
+    __ template CallRuntime<runtime::Abort>(
+        __ NoContextConstant(),
+        {.messageOrMessageId = __ SmiConstant(Smi::FromEnum(reason))});
+    // RuntimeAbort exits the function and should thus be a block terminator,
+    // but we currently don't allow Simplified operations to be block
+    // terminators. We thus manually add an Unreachable after it.
+    __ Unreachable();
     return V<None>::Invalid();
   }
 
@@ -3547,8 +3572,9 @@ class MachineLoweringReducer : public Next {
           break;
         case ElementsTransition::kSlowTransition:
           // Instance migration, call out to the runtime for {object}.
-          __ CallRuntime_TransitionElementsKind(
-              isolate_, __ NoContextConstant(), object, target_map);
+          __ template CallRuntime<runtime::TransitionElementsKind>(
+              __ NoContextConstant(),
+              {.object = object, .target_map = target_map});
           break;
       }
     }
@@ -3579,8 +3605,9 @@ class MachineLoweringReducer : public Next {
           __ StoreField(object, AccessBuilder::ForMap(), target_map);
         } else {
           // Instance migration, call out to the runtime for {object}.
-          __ CallRuntime_TransitionElementsKind(
-              isolate_, __ NoContextConstant(), object, target_map);
+          __ template CallRuntime<runtime::TransitionElementsKind>(
+              __ NoContextConstant(),
+              {.object = object, .target_map = target_map});
         }
         GOTO(done);
       }
@@ -3641,6 +3668,10 @@ class MachineLoweringReducer : public Next {
             GOTO_IF(
                 __ Word32Equal(__ UntagSmi(V<Smi>::Cast(candidate_key)), key),
                 done, candidate);
+          } ELSE IF (__ TaggedEqual(
+                        candidate_key,
+                        __ HeapConstant(factory_->hash_table_hole_value()))) {
+            // Deleted entry, continue to the next one.
           } ELSE IF (__ TaggedEqual(
                         __ LoadMapField(candidate_key),
                         __ HeapConstant(factory_->heap_number_map()))) {
@@ -4037,8 +4068,8 @@ class MachineLoweringReducer : public Next {
         __ Word32BitwiseAnd(bitfield3, Map::Bits3::IsDeprecatedBit::kMask);
     __ DeoptimizeIfNot(deprecated, frame_state, DeoptimizeReason::kWrongMap,
                        feedback);
-    V<Object> result = __ CallRuntime_TryMigrateInstance(
-        isolate_, __ NoContextConstant(), heap_object);
+    V<Object> result = __ template CallRuntime<runtime::TryMigrateInstance>(
+        __ NoContextConstant(), {.heap_object = heap_object});
     // TryMigrateInstance returns a Smi value to signal failure.
     __ DeoptimizeIf(__ ObjectIsSmi(result), frame_state,
                     DeoptimizeReason::kInstanceMigrationFailed, feedback);
@@ -4055,8 +4086,9 @@ class MachineLoweringReducer : public Next {
         __ Word32BitwiseAnd(bitfield3, Map::Bits3::IsDeprecatedBit::kMask);
     __ DeoptimizeIfNot(deprecated, frame_state, DeoptimizeReason::kWrongMap,
                        feedback);
-    __ CallRuntime_TryMigrateInstanceAndMarkMapAsMigrationTarget(
-        isolate_, __ NoContextConstant(), heap_object);
+    __ template CallRuntime<
+        runtime::TryMigrateInstanceAndMarkMapAsMigrationTarget>(
+        __ NoContextConstant(), {.heap_object = heap_object});
   }
 
   // TODO(nicohartmann@): Might use the CallBuiltinDescriptors here.
@@ -4143,8 +4175,9 @@ class MachineLoweringReducer : public Next {
                     __ HeapConstant(target_map));
     } else {
       // Instance migration, call out to the runtime for {array}.
-      __ CallRuntime_TransitionElementsKind(isolate_, __ NoContextConstant(),
-                                            array, __ HeapConstant(target_map));
+      __ template CallRuntime<runtime::TransitionElementsKind>(
+          __ NoContextConstant(),
+          {.object = array, .target_map = __ HeapConstant(target_map)});
     }
   }
 
@@ -4174,6 +4207,22 @@ class MachineLoweringReducer : public Next {
     }
     return *undetectable_objects_protector_;
   }
+
+#if V8_STATIC_ROOTS_BOOL
+  V<Word32> SafeIsAnyHole(V<HeapObject> object) {
+    Address cage_base = isolate_->cage_base();
+    V<WordPtr> ptr = __ BitcastHeapObjectToWordPtr(object);
+    ScopedVar<Word32> result(this, 0);
+    IF (__ Word32BitwiseAnd(
+            __ UintPtrLessThanOrEqual(
+                i::detail::kMinStaticHoleValue + cage_base, ptr),
+            __ UintPtrLessThanOrEqual(
+                ptr, i::detail::kMaxStaticHoleValue + cage_base))) {
+      result = 1;
+    }
+    return result;
+  }
+#endif
 
   Isolate* isolate_ = __ data() -> isolate();
   Factory* factory_ = isolate_ ? isolate_->factory() : nullptr;

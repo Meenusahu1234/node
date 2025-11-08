@@ -164,31 +164,6 @@ void MaglevAssembler::Prologue(Graph* graph) {
   }
 
   // Tiering support.
-#ifndef V8_ENABLE_LEAPTIERING
-  if (v8_flags.turbofan) {
-    using D = MaglevOptimizeCodeOrTailCallOptimizedCodeSlotDescriptor;
-    Register flags = D::GetRegisterParameter(D::kFlags);
-    Register feedback_vector = D::GetRegisterParameter(D::kFeedbackVector);
-    DCHECK(!AreAliased(
-        flags, feedback_vector,
-        kJavaScriptCallArgCountRegister,  // flags - t4, feedback - a6,
-                                          // kJavaScriptCallArgCountRegister -
-                                          // a0
-        kJSFunctionRegister, kContextRegister,
-        kJavaScriptCallNewTargetRegister));
-    DCHECK(!temps.Available().has(flags));
-    DCHECK(!temps.Available().has(feedback_vector));
-    Move(feedback_vector,
-         compilation_info()->toplevel_compilation_unit()->feedback().object());
-    Label needs_processing, done;
-    LoadFeedbackVectorFlagsAndJumpIfNeedsProcessing(
-        flags, feedback_vector, CodeKind::MAGLEV, &needs_processing);
-    Jump(&done);
-    bind(&needs_processing);
-    TailCallBuiltin(Builtin::kMaglevOptimizeCodeOrTailCallOptimizedCodeSlot);
-    bind(&done);
-  }
-#endif
 
   EnterFrame(StackFrame::MAGLEV);
   // Save arguments in frame.
@@ -246,20 +221,27 @@ void MaglevAssembler::MaybeEmitDeoptBuiltinsCall(size_t eager_deopt_count,
                                                  Label* eager_deopt_entry,
                                                  size_t lazy_deopt_count,
                                                  Label* lazy_deopt_entry) {
-  // On most platforms, we emit two shared tail calls to the eager and lazy
-  // deoptimization builtins and the individual exits just call them to save
-  // space. We do not currently do this on RISC-V, so we don't bind the two
-  // provided labels here. This matches how it is done in the RISC-V variant
-  // of CodeGenerator::PrepareForDeoptimizationExits.
-
   // We do have to avoid getting the trampoline pool emitted in the middle
   // of the deoptimization exits, because it destroys our ability to compute
   // the deoptimization index based on the 'pc' and the offset of the start
   // of the exits section.
-  ForceConstantPoolEmissionWithoutJump();
   size_t total_size = eager_deopt_count * Deoptimizer::kEagerDeoptExitSize +
                       lazy_deopt_count * Deoptimizer::kLazyDeoptExitSize;
-  CheckTrampolinePoolQuick(static_cast<int>(total_size));
+  StartBlockPools(ConstantPoolEmission::kCheck, static_cast<int>(total_size));
+  if (eager_deopt_count > 0) {
+    bind(eager_deopt_entry);
+    TemporaryRegisterScope scope(this);
+    Register scratch = scope.AcquireScratch();
+    LoadEntryFromBuiltin(Builtin::kDeoptimizationEntry_Eager, scratch);
+    MacroAssembler::Jump(scratch);
+  }
+  if (lazy_deopt_count > 0) {
+    bind(lazy_deopt_entry);
+    TemporaryRegisterScope scope(this);
+    Register scratch = scope.AcquireScratch();
+    LoadEntryFromBuiltin(Builtin::kDeoptimizationEntry_Lazy, scratch);
+    MacroAssembler::Jump(scratch);
+  }
 }
 
 void MaglevAssembler::LoadSingleCharacterString(Register result,

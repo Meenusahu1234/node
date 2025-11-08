@@ -288,7 +288,7 @@ using Variable = SnapshotTable<OpIndex, VariableData>::Key;
   V(TransitionElementsKindOrCheckMap)           \
   V(DebugPrint)                                 \
   V(CheckTurboshaftTypeOf)                      \
-  V(Word32SignHint)
+  V(TypeHint)
 
 // These Operations are the lowest level handled by Turboshaft, and are
 // supported by the InstructionSelector.
@@ -1549,34 +1549,48 @@ struct ToNumberOrNumericOp : FixedArityOperationT<3, ToNumberOrNumericOp> {
   auto options() const { return std::tuple{kind, lazy_deopt_on_throw}; }
 };
 
-// Word32SignHint is a type-hint used during Maglev->Turboshaft
-// translation to avoid having multiple values being used as both Int32 and
-// Uint32: for such cases, Maglev has explicit conversions, and it's helpful to
-// also have them in Turboshaft. Eventually, Word32SignHint is just a
-// nop in Turboshaft, since as far as Machine level graph is concerned, both
-// Int32 and Uint32 are just Word32 registers.
-struct Word32SignHintOp : FixedArityOperationT<1, Word32SignHintOp> {
-  enum class Sign : bool { kSigned, kUnsigned };
-  Sign sign;
+// TypeHint is a type-hint used during Maglev->Turboshaft
+// translation to avoid having multiple values being used as different types
+// (typically both as Int32/Uint32 or Float64/HoleyFloat64). Eventually,
+// TypeHint is just a nop in Turboshaft, since as far as Machine level
+// graph is concerned, both Int32 and Uint32 are just Word32 registers, and
+// Float64/HoleyFloat64 are just Float64 registers.
+struct TypeHintOp : FixedArityOperationT<1, TypeHintOp> {
+  enum class Type : uint8_t { kInt32, kUint32, kFloat64, kHoleyFloat64 };
+  Type type;
 
   static constexpr OpEffects effects = OpEffects();
   base::Vector<const RegisterRepresentation> outputs_rep() const {
-    return RepVector<RegisterRepresentation::Word32()>();
+    switch (type) {
+      case Type::kInt32:
+      case Type::kUint32:
+        return RepVector<RegisterRepresentation::Word32()>();
+      case Type::kFloat64:
+      case Type::kHoleyFloat64:
+        return RepVector<RegisterRepresentation::Float64()>();
+    }
   }
 
   base::Vector<const MaybeRegisterRepresentation> inputs_rep(
       ZoneVector<MaybeRegisterRepresentation>& storage) const {
-    return MaybeRepVector<MaybeRegisterRepresentation::Word32()>();
+    switch (type) {
+      case Type::kInt32:
+      case Type::kUint32:
+        return MaybeRepVector<MaybeRegisterRepresentation::Word32()>();
+      case Type::kFloat64:
+      case Type::kHoleyFloat64:
+        return MaybeRepVector<MaybeRegisterRepresentation::Float64()>();
+    }
   }
 
-  V<Word32> input() const { return Base::input<Word32>(0); }
+  V<Float64OrWord32> input() const { return Base::input<Float64OrWord32>(0); }
 
-  Word32SignHintOp(V<Word32> input, Sign sign) : Base(input), sign(sign) {}
+  TypeHintOp(V<Float64OrWord32> input, Type type) : Base(input), type(type) {}
 
-  auto options() const { return std::tuple{sign}; }
+  auto options() const { return std::tuple{type}; }
 };
 V8_EXPORT_PRIVATE std::ostream& operator<<(std::ostream& os,
-                                           Word32SignHintOp::Sign sign);
+                                           TypeHintOp::Type type);
 
 struct WordBinopOp : FixedArityOperationT<2, WordBinopOp> {
   enum class Kind : uint8_t {
@@ -3909,7 +3923,18 @@ struct WasmStackCheckOp : FixedArityOperationT<0, WasmStackCheckOp> {
   using Kind = JSStackCheckOp::Kind;
   Kind kind;
 
-  static constexpr OpEffects effects = OpEffects().CanCallAnything();
+  OpEffects Effects() const {
+    switch (kind) {
+      case Kind::kLoop:
+        return OpEffects().RequiredWhenUnused().CanReadMemory().CanAllocate();
+      case Kind::kFunctionEntry:
+        // For function entry stack checks, we could model their side effects
+        // somewhat more accurately, but it probably doesn't matter.
+        return OpEffects().CanCallAnything();
+      case Kind::kBuiltinEntry:
+        UNREACHABLE();
+    }
+  }
 
   explicit WasmStackCheckOp(Kind kind) : Base(), kind(kind) {}
 
@@ -3919,7 +3944,6 @@ struct WasmStackCheckOp : FixedArityOperationT<0, WasmStackCheckOp> {
       ZoneVector<MaybeRegisterRepresentation>& storage) const {
     return {};
   }
-
 
   auto options() const { return std::tuple{kind}; }
 };
@@ -4254,11 +4278,21 @@ struct CallOp : OperationT<CallOp> {
   void PrintOptions(std::ostream& os) const;
 };
 
+struct EffectHandler {
+  int tag_index;
+  Block* block;
+};
+
 // Catch an exception from the first operation of the `successor` block and
 // continue execution in `catch_block` in this case.
 struct CheckExceptionOp : FixedArityOperationT<1, CheckExceptionOp> {
   Block* didnt_throw_block;
   Block* catch_block;
+  // For WasmFX: an optional effect handler.
+  // A CheckExceptionOp is inserted if the operation must handle either
+  // exceptions, effects, or both. So users of this op must handle the case
+  // where {catch_block} is null or {effect_handler} is empty.
+  base::Vector<EffectHandler> effect_handlers;
 
   static constexpr OpEffects effects = OpEffects().CanCallAnything();
   base::Vector<const RegisterRepresentation> outputs_rep() const { return {}; }
@@ -4271,15 +4305,19 @@ struct CheckExceptionOp : FixedArityOperationT<1, CheckExceptionOp> {
   }
 
   CheckExceptionOp(V<Any> throwing_operation, Block* successor,
-                   Block* catch_block)
+                   Block* catch_block,
+                   base::Vector<EffectHandler> effect_handlers = {})
       : Base(throwing_operation),
         didnt_throw_block(successor),
-        catch_block(catch_block) {}
+        catch_block(catch_block),
+        effect_handlers(effect_handlers) {}
 
   V8_EXPORT_PRIVATE void Validate(const Graph& graph) const;
 
   size_t hash_value(HashingStrategy strategy = HashingStrategy::kDefault) const;
-  auto options() const { return std::tuple{didnt_throw_block, catch_block}; }
+  auto options() const {
+    return std::tuple{didnt_throw_block, catch_block, effect_handlers};
+  }
 };
 
 // This is a pseudo-operation that marks the beginning of a catch block. It
@@ -4589,7 +4627,14 @@ inline base::SmallVector<Block*, 4> SuccessorBlocks(const Operation& op) {
   switch (op.opcode) {
     case Opcode::kCheckException: {
       auto& casted = op.Cast<CheckExceptionOp>();
-      return {casted.didnt_throw_block, casted.catch_block};
+      base::SmallVector<Block*, 4> res{casted.didnt_throw_block};
+      if (casted.catch_block) {
+        res.push_back(casted.catch_block);
+      }
+      for (auto& effect_handler : casted.effect_handlers) {
+        res.push_back(effect_handler.block);
+      }
+      return res;
     }
     case Opcode::kGoto: {
       auto& casted = op.Cast<GotoOp>();
@@ -5023,9 +5068,7 @@ struct ConvertJSPrimitiveToUntaggedOp
     kUint32,
     kBit,
     kFloat64,
-#ifdef V8_ENABLE_UNDEFINED_DOUBLE
     kHoleyFloat64,
-#endif  // V8_ENABLE_UNDEFINED_DOUBLE
   };
   enum class InputAssumptions : uint8_t {
     kBoolean,
@@ -5052,9 +5095,7 @@ struct ConvertJSPrimitiveToUntaggedOp
       case UntaggedKind::kInt64:
         return RepVector<RegisterRepresentation::Word64()>();
       case UntaggedKind::kFloat64:
-#ifdef V8_ENABLE_UNDEFINED_DOUBLE
       case UntaggedKind::kHoleyFloat64:
-#endif  // V8_ENABLE_UNDEFINED_DOUBLE
         return RepVector<RegisterRepresentation::Float64()>();
     }
   }
@@ -8099,8 +8140,8 @@ V8_EXPORT_PRIVATE std::ostream& operator<<(std::ostream& os,
   V(F64x2Floor)                                                               \
   V(F64x2Trunc)                                                               \
   V(F64x2NearestInt)                                                          \
-  /* TODO(mliedtke): Rename to ReverseBytes once the naming is decoupled from \
-   * Turbofan naming. */                                                      \
+  /* TODO(mliedtke): Rename to ReverseBytes once the naming is decoupled   */ \
+  /* from Turbofan naming. */                                                 \
   V(Simd128ReverseBytes)
 
 #define FOREACH_SIMD_128_UNARY_OPCODE(V)        \
@@ -9685,6 +9726,7 @@ constexpr size_t input_count(const base::Flags<T>) {
 }
 constexpr size_t input_count(const Block*) { return 0; }
 constexpr size_t input_count(const TSCallDescriptor*) { return 0; }
+constexpr size_t input_count(base::Vector<EffectHandler>) { return 0; }
 constexpr size_t input_count(const char*) { return 0; }
 constexpr size_t input_count(const DeoptimizeParameters*) { return 0; }
 constexpr size_t input_count(const FastApiCallParameters*) { return 0; }
@@ -9714,7 +9756,6 @@ constexpr size_t input_count(wasm::ValueType) { return 0; }
 constexpr size_t input_count(WasmTypeCheckConfig) { return 0; }
 constexpr size_t input_count(wasm::ModuleTypeIndex) { return 0; }
 constexpr size_t input_count(std::optional<AtomicMemoryOrder>) { return 0; }
-
 #endif
 
 // All parameters that are OpIndex-like (ie, OpIndex, and OpIndex containers)

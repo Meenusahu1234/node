@@ -52,6 +52,7 @@
 #include "src/maglev/maglev-interpreter-frame-state.h"
 #include "src/maglev/maglev-ir-inl.h"
 #include "src/maglev/maglev-ir.h"
+#include "src/maglev/maglev-known-node-aspects.h"
 #include "src/maglev/maglev-reducer-inl.h"
 #include "src/maglev/maglev-reducer.h"
 #include "src/numbers/conversions.h"
@@ -255,7 +256,7 @@ class CallArguments {
       args_.insert(args_.data(), receiver);
       receiver_mode_ = ConvertReceiverMode::kAny;
     } else {
-      DCHECK(!receiver->properties().is_conversion());
+      DCHECK(!receiver->is_conversion());
       args_[0] = receiver;
     }
   }
@@ -297,6 +298,13 @@ class CallArguments {
     args_.pop_back();
   }
 
+  void ResizeDefaultArguments(size_t new_count) {
+    DCHECK_EQ(mode_, kDefault);
+    DCHECK_GT(count(), new_count);
+    args_.resize(new_count + index_offset());
+    DCHECK_EQ(count(), new_count);
+  }
+
   void PopReceiver(ConvertReceiverMode new_receiver_mode) {
     DCHECK_NE(receiver_mode_, ConvertReceiverMode::kNullOrUndefined);
     DCHECK_NE(new_receiver_mode, ConvertReceiverMode::kNullOrUndefined);
@@ -325,7 +333,7 @@ class CallArguments {
     // Arguments can leak to the interpreter frame if the call is inlined,
     // conversions should be stored in known_node_aspects/NodeInfo.
     for (ValueNode* arg : args_) {
-      DCHECK(!arg->properties().is_conversion());
+      DCHECK(!arg->is_conversion());
     }
 #endif  // DEBUG
   }
@@ -1702,14 +1710,13 @@ ReduceResult MaglevGraphBuilder::GetSmiValue(
   auto& alternative = node_info->alternative();
 
   if (ValueNode* alt = alternative.tagged()) {
-    // HoleyFloat64ToTagged does not canonicalize Smis by default, since it can
-    // be expensive. If we are reading a Smi value, we should try to
-    // canonicalize now.
+#ifdef DEBUG
     if (HoleyFloat64ToTagged* conversion_node =
             alt->TryCast<HoleyFloat64ToTagged>()) {
-      conversion_node->SetMode(
-          HoleyFloat64ToTagged::ConversionMode::kCanonicalizeSmi);
+      DCHECK_EQ(conversion_node->conversion_mode(),
+                HoleyFloat64ToTagged::ConversionMode::kCanonicalizeSmi);
     }
+#endif  // DEBUG
     return BuildCheckSmi(alt, !value->Is<Phi>());
   }
 
@@ -1736,8 +1743,15 @@ ReduceResult MaglevGraphBuilder::GetSmiValue(
     }
     case ValueRepresentation::kHoleyFloat64: {
       return alternative.set_tagged(
-          AddNewNodeNoInputConversion<CheckedSmiTagFloat64>({value}));
+          AddNewNodeNoInputConversion<CheckedSmiTagHoleyFloat64>({value}));
     }
+    case ValueRepresentation::kShiftedInt53:
+      if (NodeTypeIsSmi(node_info->type())) {
+        return alternative.set_tagged(
+            AddNewNodeNoInputConversion<UnsafeSmiTagShiftedInt53>({value}));
+      }
+      return alternative.set_tagged(
+          AddNewNodeNoInputConversion<CheckedSmiTagShiftedInt53>({value}));
     case ValueRepresentation::kIntPtr:
       return alternative.set_tagged(
           AddNewNodeNoInputConversion<CheckedSmiTagIntPtr>({value}));
@@ -1797,78 +1811,6 @@ ValueNode* MaglevGraphBuilder::GetTruncatedInt32ForToNumber(
   return reducer_.GetTruncatedInt32ForToNumber(value, allowed_input_type);
 }
 
-#ifdef V8_ENABLE_UNDEFINED_DOUBLE
-std::optional<double> MaglevGraphBuilder::TryGetHoleyFloat64Constant(
-    ValueNode* value) {
-  if (value->opcode() == Opcode::kRootConstant) {
-    Tagged<Object> root_object =
-        local_isolate_->root(value->Cast<RootConstant>()->index());
-    if (IsOddball(root_object)) {
-      return Cast<Oddball>(root_object)->to_number_raw();
-    }
-  }
-  std::optional<double> constant = TryGetFloat64Constant(
-      value, TaggedToFloat64ConversionType::kNumberOrOddball);
-  if (constant.has_value() && std::isnan(constant.value())) {
-    // If need to silence nans when converting from Float64 to HoleyFloat64
-    // representation.
-    return std::numeric_limits<double>::quiet_NaN();
-  }
-  return constant;
-}
-
-ValueNode* MaglevGraphBuilder::GetHoleyFloat64(
-    ValueNode* value, TaggedToFloat64ConversionType conversion_type,
-    bool convert_hole_to_undefined) {
-  ValueRepresentation representation =
-      value->properties().value_representation();
-  if (representation == ValueRepresentation::kHoleyFloat64 &&
-      !convert_hole_to_undefined) {
-    return value;
-  }
-
-  // Process constants first to avoid allocating NodeInfo for them.
-  if (auto cst = TryGetHoleyFloat64Constant(value)) {
-    return GetFloat64Constant(cst.value());
-  }
-
-  NodeInfo* node_info = GetOrCreateInfoFor(value);
-
-  switch (representation) {
-    case ValueRepresentation::kTagged:
-      return AddNewNodeNoInputConversion<CheckedNumberOrOddballToHoleyFloat64>(
-          {value}, conversion_type);
-    case ValueRepresentation::kInt32: {
-      auto& alternative = node_info->alternative();
-      return alternative.set_float64(
-          AddNewNodeNoInputConversion<ChangeInt32ToFloat64>({value}));
-    }
-    case ValueRepresentation::kUint32: {
-      auto& alternative = node_info->alternative();
-      return alternative.set_float64(
-          AddNewNodeNoInputConversion<ChangeUint32ToFloat64>({value}));
-    }
-    case ValueRepresentation::kFloat64:
-      // We need to silence NaNs, because we start interpreting some bit
-      // patterns differently.
-      return AddNewNodeNoInputConversion<HoleyFloat64ToMaybeNanFloat64>(
-          {value});
-    case ValueRepresentation::kHoleyFloat64:
-      DCHECK(convert_hole_to_undefined);
-      if (!IsEmptyNodeType(node_info->type()) &&
-          NodeTypeIs(node_info->type(), NodeType::kNumberOrBoolean)) {
-        // We don't have holes, so we don't need to convert anything.
-        return value;
-      }
-      return AddNewNodeNoInputConversion<ConvertHoleNanToUndefinedNan>({value});
-    case ValueRepresentation::kIntPtr:
-      return AddNewNodeNoInputConversion<ChangeIntPtrToFloat64>({value});
-    case ValueRepresentation::kNone:
-      UNREACHABLE();
-  }
-}
-#endif  // V8_ENABLE_UNDEFINED_DOUBLE
-
 namespace {
 int32_t ClampToUint8(int32_t value) {
   if (value < 0) return 0;
@@ -1911,6 +1853,8 @@ ValueNode* MaglevGraphBuilder::GetUint8ClampedForToNumber(ValueNode* value) {
       return AddNewNodeNoInputConversion<Int32ToUint8Clamped>({value});
     case ValueRepresentation::kUint32:
       return AddNewNodeNoInputConversion<Uint32ToUint8Clamped>({value});
+    case ValueRepresentation::kShiftedInt53:
+      UNIMPLEMENTED();
     case ValueRepresentation::kNone:
       UNREACHABLE();
   }
@@ -1969,7 +1913,7 @@ using Int32NodeFor = typename Int32NodeForHelper<kOperation>::type;
 
 template <Operation kOperation>
 struct Float64NodeForHelper;
-#define SPECIALIZATION(op, OpNode)                \
+#define SPECIALIZATION(op, OpNode, ...)           \
   template <>                                     \
   struct Float64NodeForHelper<Operation::k##op> { \
     using type = OpNode;                          \
@@ -2104,7 +2048,7 @@ ReduceResult MaglevGraphBuilder::BuildFloat64BinarySmiOperationNodeForToNumber(
     NodeType allowed_input_type) {
   // TODO(v8:7700): Do constant identity folding. Make sure to normalize
   // HoleyFloat64 nodes if folded.
-  ValueNode* left = GetAccumulatorHoleyFloat64ForToNumber(allowed_input_type);
+  ValueNode* left = GetAccumulatorFloat64ForToNumber(allowed_input_type);
   double constant = static_cast<double>(iterator_.GetImmediateOperand(0));
   PROCESS_AND_RETURN_IF_DONE(
       reducer_.TryFoldFloat64BinaryOperationForToNumber<kOperation>(
@@ -2119,7 +2063,7 @@ ReduceResult MaglevGraphBuilder::BuildFloat64UnaryOperationNodeForToNumber(
     NodeType allowed_input_type) {
   // TODO(v8:7700): Do constant identity folding. Make sure to normalize
   // HoleyFloat64 nodes if folded.
-  ValueNode* value = GetAccumulatorHoleyFloat64ForToNumber(allowed_input_type);
+  ValueNode* value = GetAccumulatorFloat64ForToNumber(allowed_input_type);
   PROCESS_AND_RETURN_IF_DONE(
       reducer_.TryFoldFloat64UnaryOperationForToNumber<kOperation>(
           GetTaggedToFloat64ConversionType(allowed_input_type), value),
@@ -2143,8 +2087,8 @@ ReduceResult MaglevGraphBuilder::BuildFloat64BinaryOperationNodeForToNumber(
     NodeType allowed_input_type) {
   // TODO(v8:7700): Do constant identity folding. Make sure to normalize
   // HoleyFloat64 nodes if folded.
-  ValueNode* left = LoadRegisterHoleyFloat64ForToNumber(0, allowed_input_type);
-  ValueNode* right = GetAccumulatorHoleyFloat64ForToNumber(allowed_input_type);
+  ValueNode* left = LoadRegisterFloat64ForToNumber(0, allowed_input_type);
+  ValueNode* right = GetAccumulatorFloat64ForToNumber(allowed_input_type);
   PROCESS_AND_RETURN_IF_DONE(
       reducer_.TryFoldFloat64BinaryOperationForToNumber<kOperation>(
           GetTaggedToFloat64ConversionType(allowed_input_type), left, right),
@@ -2311,6 +2255,8 @@ size_t MaglevGraphBuilder::StringLengthStaticLowerBound(ValueNode* string,
         return ConsString::kMinLength;
       }
       break;
+    case Opcode::kNewConsString:
+      return ConsString::kMinLength;
     case Opcode::kStringConcat:
       if (max_depth == 0) return 0;
       return StringLengthStaticLowerBound(string->input(0).node(),
@@ -2517,9 +2463,20 @@ ReduceResult MaglevGraphBuilder::VisitBinaryOperation() {
     case BinaryOperationHint::kNone:
       return EmitUnconditionalDeopt(
           DeoptimizeReason::kInsufficientTypeFeedbackForBinaryOperation);
+    case BinaryOperationHint::kAdditiveSafeInteger:
+      if (is_turbolev() && Is64() &&
+          v8_flags.turbolev_additive_safe_int_feedback) {
+        DCHECK_EQ(kOperation, Operation::kAdd);
+        ValueNode* left = LoadRegister(0);
+        ValueNode* right = GetAccumulator();
+        PROCESS_AND_RETURN_IF_DONE(reducer_.TryFoldShiftedInt53Add(left, right),
+                                   SetAccumulator);
+        return SetAccumulator(AddNewNode<ShiftedInt53AddWithOverflow>(
+            {reducer_.GetShiftedInt53(left), reducer_.GetShiftedInt53(right)}));
+      }
+      [[fallthrough]];
     case BinaryOperationHint::kSignedSmall:
     case BinaryOperationHint::kSignedSmallInputs:
-    case BinaryOperationHint::kAdditiveSafeInteger:
     case BinaryOperationHint::kNumber:
     case BinaryOperationHint::kNumberOrOddball: {
       NodeType allowed_input_type =
@@ -2591,9 +2548,20 @@ ReduceResult MaglevGraphBuilder::VisitBinarySmiOperation() {
     case BinaryOperationHint::kNone:
       return EmitUnconditionalDeopt(
           DeoptimizeReason::kInsufficientTypeFeedbackForBinaryOperation);
+    case BinaryOperationHint::kAdditiveSafeInteger:
+      if (is_turbolev() && Is64() &&
+          v8_flags.turbolev_additive_safe_int_feedback) {
+        DCHECK_EQ(kOperation, Operation::kAdd);
+        ValueNode* left = GetAccumulator();
+        ValueNode* right = GetInt32Constant(iterator_.GetImmediateOperand(0));
+        PROCESS_AND_RETURN_IF_DONE(reducer_.TryFoldShiftedInt53Add(left, right),
+                                   SetAccumulator);
+        return SetAccumulator(AddNewNode<ShiftedInt53AddWithOverflow>(
+            {reducer_.GetShiftedInt53(left), reducer_.GetShiftedInt53(right)}));
+      }
+      [[fallthrough]];
     case BinaryOperationHint::kSignedSmall:
     case BinaryOperationHint::kSignedSmallInputs:
-    case BinaryOperationHint::kAdditiveSafeInteger:
     case BinaryOperationHint::kNumber:
     case BinaryOperationHint::kNumberOrOddball: {
       NodeType allowed_input_type =
@@ -2748,10 +2716,9 @@ MaybeReduceResult MaglevGraphBuilder::TryReduceCompareEqualAgainstConstant() {
       right->properties().value_representation() !=
           ValueRepresentation::kTagged) {
     SetAccumulator(GetBooleanConstant(false));
-  } else {
-    SetAccumulator(BuildTaggedEqual(left, right));
+    return ReduceResult::Done();
   }
-  return ReduceResult::Done();
+  return SetAccumulator(BuildTaggedEqual(left, right));
 }
 
 template <Operation kOperation>
@@ -2925,8 +2892,7 @@ ReduceResult MaglevGraphBuilder::VisitCompareOperation() {
           right,
           GetInternalizedString(interpreter::Register::virtual_accumulator()));
       if (TryConstantFoldEqual(left, right)) return ReduceResult::Done();
-      SetAccumulator(BuildTaggedEqual(left, right));
-      return ReduceResult::Done();
+      return SetAccumulator(BuildTaggedEqual(left, right));
     }
     case CompareOperationHint::kSymbol: {
       DCHECK(kOperation == Operation::kEqual ||
@@ -2937,8 +2903,7 @@ ReduceResult MaglevGraphBuilder::VisitCompareOperation() {
       RETURN_IF_ABORT(BuildCheckSymbol(left));
       RETURN_IF_ABORT(BuildCheckSymbol(right));
       if (TryConstantFoldEqual(left, right)) return ReduceResult::Done();
-      SetAccumulator(BuildTaggedEqual(left, right));
-      return ReduceResult::Done();
+      return SetAccumulator(BuildTaggedEqual(left, right));
     }
     case CompareOperationHint::kString: {
       ValueNode* left = LoadRegister(0);
@@ -3014,8 +2979,7 @@ ReduceResult MaglevGraphBuilder::VisitCompareOperation() {
       ValueNode* right = GetAccumulator();
       RETURN_IF_ABORT(BuildCheckJSReceiverOrNullOrUndefined(left));
       RETURN_IF_ABORT(BuildCheckJSReceiverOrNullOrUndefined(right));
-      SetAccumulator(BuildTaggedEqual(left, right));
-      return ReduceResult::Done();
+      return SetAccumulator(BuildTaggedEqual(left, right));
     }
     case CompareOperationHint::kReceiver: {
       DCHECK(kOperation == Operation::kEqual ||
@@ -3025,8 +2989,7 @@ ReduceResult MaglevGraphBuilder::VisitCompareOperation() {
       ValueNode* right = GetAccumulator();
       RETURN_IF_ABORT(BuildCheckJSReceiver(left));
       RETURN_IF_ABORT(BuildCheckJSReceiver(right));
-      SetAccumulator(BuildTaggedEqual(left, right));
-      return ReduceResult::Done();
+      return SetAccumulator(BuildTaggedEqual(left, right));
     }
   }
 
@@ -3120,10 +3083,8 @@ ValueNode* MaglevGraphBuilder::TrySpecializeLoadContextSlot(
   int offset = Context::OffsetOfElementAt(index);
   if (!maybe_value->IsContextCell()) {
     // No need to check for context cells anymore.
-    ValueNode* value;
-    GET_VALUE(value, BuildLoadTaggedField<LoadTaggedFieldForContextSlotNoCells>(
-                         context_node, offset));
-    return value;
+    RETURN_VALUE(
+        AddNewNode<LoadContextSlotNoCells>({context_node}, offset, false));
   }
   compiler::ContextCellRef slot_ref = maybe_value->AsContextCell();
   ContextCell::State state = slot_ref.state();
@@ -3131,23 +3092,17 @@ ValueNode* MaglevGraphBuilder::TrySpecializeLoadContextSlot(
     case ContextCell::kConst: {
       auto constant = slot_ref.tagged_value(broker());
       if (!constant.has_value()) {
-        ValueNode* value;
-        GET_VALUE(value,
-                  BuildLoadTaggedField<LoadTaggedFieldForContextSlotNoCells>(
-                      context_node, offset));
-        return value;
+        RETURN_VALUE(
+            AddNewNode<LoadContextSlotNoCells>({context_node}, offset, false));
       }
       broker()->dependencies()->DependOnContextCell(slot_ref, state);
       return GetConstant(*constant);
     }
     case ContextCell::kSmi: {
       broker()->dependencies()->DependOnContextCell(slot_ref, state);
-      ValueNode* value;
-      GET_VALUE(value,
-                BuildLoadTaggedField(GetConstant(slot_ref),
-                                     offsetof(ContextCell, tagged_value_),
-                                     LoadType::kSmi));
-      return value;
+      RETURN_VALUE(BuildLoadTaggedField(GetConstant(slot_ref),
+                                        offsetof(ContextCell, tagged_value_),
+                                        LoadType::kSmi));
     }
     case ContextCell::kInt32:
       broker()->dependencies()->DependOnContextCell(slot_ref, state);
@@ -3160,11 +3115,8 @@ ValueNode* MaglevGraphBuilder::TrySpecializeLoadContextSlot(
           {GetConstant(slot_ref)},
           static_cast<int>(offsetof(ContextCell, double_value_)));
     case ContextCell::kDetached: {
-      ValueNode* value;
-      GET_VALUE(value,
-                BuildLoadTaggedField<LoadTaggedFieldForContextSlotNoCells>(
-                    context_node, offset));
-      return value;
+      RETURN_VALUE(
+          AddNewNode<LoadContextSlotNoCells>({context_node}, offset, false));
     }
   }
   UNREACHABLE();
@@ -3193,13 +3145,16 @@ ValueNode* MaglevGraphBuilder::LoadAndCacheContextSlot(
     // We collect feedback only for mutable context slots.
     cached_value = TrySpecializeLoadContextSlot(context, index);
     if (cached_value) return cached_value;
-    GET_VALUE(cached_value, BuildLoadTaggedField<LoadTaggedFieldForContextSlot>(
-                                context, offset));
+    GET_VALUE(cached_value,
+              AddNewNode<LoadContextSlot>(
+                  {context}, offset,
+                  slot_mutability == ContextSlotMutability::kImmutable));
     return cached_value;
   }
   GET_VALUE(cached_value,
-            BuildLoadTaggedField<LoadTaggedFieldForContextSlotNoCells>(context,
-                                                                       offset));
+            AddNewNode<LoadContextSlotNoCells>(
+                {context}, offset,
+                slot_mutability == ContextSlotMutability::kImmutable));
   return cached_value;
 }
 
@@ -3220,13 +3175,11 @@ bool MaglevGraphBuilder::ContextMayAlias(
 }
 
 MaybeReduceResult MaglevGraphBuilder::TrySpecializeStoreContextSlot(
-    ValueNode* context, int index, ValueNode* value, Node** store) {
-  DCHECK_NOT_NULL(store);
+    ValueNode* context, int index, ValueNode* value) {
   DCHECK(v8_flags.script_context_cells || v8_flags.function_context_cells);
   if (!context->Is<Constant>()) {
-    GET_NODE_OR_ABORT(*store, AddNewNode<StoreContextSlotWithWriteBarrier>(
-                                  {context, value}, index));
-    return ReduceResult::Done();
+    return AddNewNode<StoreContextSlotWithWriteBarrier>({context, value},
+                                                        index);
   }
 
   if (IsEmptyNodeType(GetType(value))) {
@@ -3238,15 +3191,14 @@ MaybeReduceResult MaglevGraphBuilder::TrySpecializeStoreContextSlot(
   auto maybe_value = context_ref.get(broker(), index);
   if (!maybe_value || maybe_value->IsTheHole() ||
       maybe_value->IsUndefinedContextCell()) {
-    GET_NODE_OR_ABORT(*store, AddNewNode<StoreContextSlotWithWriteBarrier>(
-                                  {context, value}, index));
-    return ReduceResult::Done();
+    return AddNewNode<StoreContextSlotWithWriteBarrier>({context, value},
+                                                        index);
   }
 
   int offset = Context::OffsetOfElementAt(index);
   if (!maybe_value->IsContextCell()) {
     return BuildStoreTaggedField(context, value, offset,
-                                 StoreTaggedMode::kDefault, store);
+                                 StoreTaggedMode::kDefaultToContext);
   }
 
   compiler::ContextCellRef slot_ref = maybe_value->AsContextCell();
@@ -3256,9 +3208,8 @@ MaybeReduceResult MaglevGraphBuilder::TrySpecializeStoreContextSlot(
       auto constant = slot_ref.tagged_value(broker());
       if (!constant.has_value() ||
           (constant->IsString() && !constant->IsInternalizedString())) {
-        GET_NODE_OR_ABORT(*store, AddNewNode<StoreContextSlotWithWriteBarrier>(
-                                      {context, value}, index));
-        return ReduceResult::Done();
+        return AddNewNode<StoreContextSlotWithWriteBarrier>({context, value},
+                                                            index);
       }
       broker()->dependencies()->DependOnContextCell(slot_ref, state);
       return BuildCheckNumericalValueOrByReference(
@@ -3267,30 +3218,26 @@ MaybeReduceResult MaglevGraphBuilder::TrySpecializeStoreContextSlot(
     case ContextCell::kSmi:
       // HoleyFloat64ToTagged does not canonicalize Smis by default, use
       // GetSmiValue to force canonicalization for the value if necessary.
+      // TODO(454485895): Consider removing this workaround since
+      // HoleyFloat64ToTagged now canonicalizes by default.
       RETURN_IF_ABORT(GetSmiValue(value));
       broker()->dependencies()->DependOnContextCell(slot_ref, state);
-      return BuildStoreTaggedFieldNoWriteBarrier(
-          GetConstant(slot_ref), value, offsetof(ContextCell, tagged_value_),
-          StoreTaggedMode::kDefault, store);
+      return AddNewNode<StoreSmiContextCell>({GetConstant(slot_ref), value},
+                                             context_ref, offset);
     case ContextCell::kInt32:
       EnsureInt32(value, true);
-      GET_NODE_OR_ABORT(
-          *store, AddNewNode<StoreInt32>(
-                      {GetConstant(slot_ref), value},
-                      static_cast<int>(offsetof(ContextCell, double_value_))));
       broker()->dependencies()->DependOnContextCell(slot_ref, state);
-      return ReduceResult::Done();
+      return AddNewNode<StoreInt32ContextCell>({GetConstant(slot_ref), value},
+                                               context_ref, offset);
+
     case ContextCell::kFloat64:
       RETURN_IF_ABORT(BuildCheckNumber(value));
-      GET_NODE_OR_ABORT(
-          *store, AddNewNode<StoreFloat64>(
-                      {GetConstant(slot_ref), value},
-                      static_cast<int>(offsetof(ContextCell, double_value_))));
       broker()->dependencies()->DependOnContextCell(slot_ref, state);
-      return ReduceResult::Done();
+      return AddNewNode<StoreFloat64ContextCell>({GetConstant(slot_ref), value},
+                                                 context_ref, offset);
     case ContextCell::kDetached:
       return BuildStoreTaggedField(context, value, offset,
-                                   StoreTaggedMode::kDefault, store);
+                                   StoreTaggedMode::kDefaultToContext);
   }
   UNREACHABLE();
 }
@@ -3305,63 +3252,44 @@ ReduceResult MaglevGraphBuilder::StoreAndCacheContextSlot(
   if ((v8_flags.script_context_cells || v8_flags.function_context_cells) &&
       context_mode == ContextMode::kHasContextCells) {
     MaybeReduceResult result =
-        TrySpecializeStoreContextSlot(context, index, value, &store);
+        TrySpecializeStoreContextSlot(context, index, value);
     RETURN_IF_ABORT(result);
-    if (!store && result.IsDone()) {
+    if (result.IsDoneWithoutPayload()) {
       // If we didn't need to emit any store, there is nothing to cache.
       return result.Checked();
     }
-  }
-
-  if (!store) {
-    RETURN_IF_ABORT(BuildStoreTaggedField(context, value, offset,
-                                          StoreTaggedMode::kDefault, &store));
+    DCHECK(result.IsDoneWithPayload());
+    store = result.node();
+  } else {
+    GET_NODE_OR_ABORT(
+        store, BuildStoreTaggedField(context, value, offset,
+                                     StoreTaggedMode::kDefaultToContext));
   }
 
   TRACE("  * Recording context slot store " << PrintNodeLabel(context) << "["
                                             << offset
                                             << "]: " << PrintNode(value));
-  KnownNodeAspects::LoadedContextSlots& loaded_context_slots =
-      known_node_aspects().loaded_context_slots();
-  if (!loaded_context_slots.empty()) {
-    known_node_aspects().UpdateMayHaveAliasingContexts(
-        broker(), local_isolate(), context);
-  }
-  if (known_node_aspects().may_have_aliasing_contexts() ==
-      KnownNodeAspects::ContextSlotLoadsAlias::kYes) {
-    compiler::OptionalScopeInfoRef scope_info =
-        graph()->TryGetScopeInfo(context);
-    for (auto& cache : loaded_context_slots) {
-      if (std::get<int>(cache.first) == offset &&
-          std::get<ValueNode*>(cache.first) != context) {
-        if (ContextMayAlias(std::get<ValueNode*>(cache.first), scope_info) &&
-            cache.second != value) {
-          TRACE("  * Clearing probably aliasing value "
-                << PrintNodeLabel(std::get<ValueNode*>(cache.first)) << "["
-                << offset << "]: " << PrintNode(value));
-          cache.second = nullptr;
-          if (is_loop_effect_tracking()) {
-            loop_effects_->context_slot_written.insert(cache.first);
-            loop_effects_->may_have_aliasing_contexts = true;
-          }
-        }
-      }
-    }
-  }
+
+  auto aliased_slots = known_node_aspects().ClearAliasedContextSlotsFor(
+      graph(), context, offset, value);
+  bool added_to_cache =
+      known_node_aspects().SetContextCachedValue(context, offset, value);
+
+  // Update loop effect state.
   KnownNodeAspects::LoadedContextSlotsKey key{context, offset};
-  auto updated = loaded_context_slots.emplace(key, value);
-  if (updated.second) {
-    if (is_loop_effect_tracking()) {
-      loop_effects_->context_slot_written.insert(key);
+  if (is_loop_effect_tracking()) {
+    for (auto slot : aliased_slots) {
+      loop_effects_->context_slot_written.insert(slot);
+      loop_effects_->may_have_aliasing_contexts = true;
     }
+    loop_effects_->context_slot_written.insert(key);
+  }
+
+  // Update last context store cache and kill the previous store.
+  // TODO(victorgomes): Port this store-store elimination to the optimizer.
+  if (added_to_cache) {
     unobserved_context_slot_stores_[key] = store;
   } else {
-    if (updated.first->second != value) {
-      updated.first->second = value;
-      if (is_loop_effect_tracking()) {
-        loop_effects_->context_slot_written.insert(key);
-      }
-    }
     if (known_node_aspects().may_have_aliasing_contexts() !=
         KnownNodeAspects::ContextSlotLoadsAlias::kYes) {
       auto last_store = unobserved_context_slot_stores_.find(key);
@@ -3373,6 +3301,7 @@ ReduceResult MaglevGraphBuilder::StoreAndCacheContextSlot(
       }
     }
   }
+
   return ReduceResult::Done();
 }
 
@@ -3509,8 +3438,8 @@ ReduceResult MaglevGraphBuilder::VisitPopContext() {
   return ReduceResult::Done();
 }
 
-ValueNode* MaglevGraphBuilder::BuildTaggedEqual(ValueNode* lhs,
-                                                ValueNode* rhs) {
+ReduceResult MaglevGraphBuilder::BuildTaggedEqual(ValueNode* lhs,
+                                                  ValueNode* rhs) {
   ValueNode* tagged_lhs = GetTaggedValue(lhs);
   ValueNode* tagged_rhs = GetTaggedValue(rhs);
   if (tagged_lhs == tagged_rhs) {
@@ -3530,16 +3459,15 @@ ValueNode* MaglevGraphBuilder::BuildTaggedEqual(ValueNode* lhs,
   return AddNewNodeNoInputConversion<TaggedEqual>({tagged_lhs, tagged_rhs});
 }
 
-ValueNode* MaglevGraphBuilder::BuildTaggedEqual(ValueNode* lhs,
-                                                RootIndex rhs_index) {
+ReduceResult MaglevGraphBuilder::BuildTaggedEqual(ValueNode* lhs,
+                                                  RootIndex rhs_index) {
   return BuildTaggedEqual(lhs, GetRootConstant(rhs_index));
 }
 
 ReduceResult MaglevGraphBuilder::VisitTestReferenceEqual() {
   ValueNode* lhs = LoadRegister(0);
   ValueNode* rhs = GetAccumulator();
-  SetAccumulator(BuildTaggedEqual(lhs, rhs));
-  return ReduceResult::Done();
+  return SetAccumulator(BuildTaggedEqual(lhs, rhs));
 }
 
 ValueNode* MaglevGraphBuilder::BuildTestUndetectable(ValueNode* value) {
@@ -3624,14 +3552,12 @@ ReduceResult MaglevGraphBuilder::VisitTestUndetectable() {
 
 ReduceResult MaglevGraphBuilder::VisitTestNull() {
   ValueNode* value = GetAccumulator();
-  SetAccumulator(BuildTaggedEqual(value, RootIndex::kNullValue));
-  return ReduceResult::Done();
+  return SetAccumulator(BuildTaggedEqual(value, RootIndex::kNullValue));
 }
 
 ReduceResult MaglevGraphBuilder::VisitTestUndefined() {
   ValueNode* value = GetAccumulator();
-  SetAccumulator(BuildTaggedEqual(value, RootIndex::kUndefinedValue));
-  return ReduceResult::Done();
+  return SetAccumulator(BuildTaggedEqual(value, RootIndex::kUndefinedValue));
 }
 
 template <typename Function>
@@ -4133,6 +4059,10 @@ ReduceResult MaglevGraphBuilder::BuildCheckSmi(ValueNode* object,
     return EmitUnconditionalDeopt(DeoptimizeReason::kSmi);
   }
   if (EnsureType(object, NodeType::kSmi) && elidable) return object;
+  // For constants, we may be able to skip the runtime check.
+  if (std::optional<int32_t> constant_value = TryGetInt32Constant(object)) {
+    if (Smi::IsValid(constant_value.value())) return object;
+  }
   switch (object->value_representation()) {
     case ValueRepresentation::kInt32:
       if (!SmiValuesAre32Bits()) {
@@ -4152,7 +4082,9 @@ ReduceResult MaglevGraphBuilder::BuildCheckSmi(ValueNode* object,
     case ValueRepresentation::kIntPtr:
       AddNewNodeNoInputConversion<CheckIntPtrIsSmi>({object});
       break;
-    case maglev::ValueRepresentation::kNone:
+    case ValueRepresentation::kShiftedInt53:
+      UNIMPLEMENTED();
+    case ValueRepresentation::kNone:
       UNREACHABLE();
   }
   return object;
@@ -4297,44 +4229,11 @@ ReduceResult MaglevGraphBuilder::BuildCheckMaps(
     std::optional<ValueNode*> map,
     bool has_deprecated_map_without_migration_target,
     bool migration_done_outside) {
-  // TODO(verwaest): Support other objects with possible known stable maps as
-  // well.
-  RETURN_IF_DONE(reducer_.TryFoldCheckMaps(object, maps));
+  KnownMapsMerger<base::Vector<const compiler::MapRef>> merger(broker(), zone(),
+                                                               maps);
+  RETURN_IF_DONE(reducer_.TryFoldCheckMaps(object, nullptr, maps, merger));
 
   NodeInfo* known_info = GetOrCreateInfoFor(object);
-
-  // Calculates if known maps are a subset of maps, their map intersection and
-  // whether we should emit check with migration.
-  KnownMapsMerger merger(broker(), zone(), maps);
-  merger.IntersectWithKnownNodeAspects(object, known_node_aspects());
-
-  if (IsEmptyNodeType(IntersectType(merger.node_type(), GetType(object)))) {
-    return EmitUnconditionalDeopt(DeoptimizeReason::kWrongMap);
-  }
-  // If the known maps are the subset of the maps to check, we are done.
-  if (merger.known_maps_are_subset_of_requested_maps()) {
-    // The node type of known_info can get out of sync with the possible maps.
-    // For instance after merging with an effectively dead branch (i.e., check
-    // contradicting all possible maps).
-    // TODO(olivf) Try to combine node_info and possible maps and ensure that
-    // narrowing the type also clears impossible possible_maps.
-    if (!NodeTypeIs(known_info->type(), merger.node_type())) {
-      known_info->UnionType(merger.node_type());
-    }
-#ifdef DEBUG
-    // Double check that, for every possible map, it's one of the maps we'd
-    // want to check.
-    for (compiler::MapRef possible_map :
-         known_node_aspects().TryGetInfoFor(object)->possible_maps()) {
-      DCHECK_NE(std::find(maps.begin(), maps.end(), possible_map), maps.end());
-    }
-#endif
-    return ReduceResult::Done();
-  }
-
-  if (merger.intersect_set().is_empty()) {
-    return EmitUnconditionalDeopt(DeoptimizeReason::kWrongMap);
-  }
 
   // TODO(v8:7700): Check if the {maps} - {known_maps} size is smaller than
   // {maps} \intersect {known_maps}, we can emit CheckNotMaps instead.
@@ -4349,7 +4248,8 @@ ReduceResult MaglevGraphBuilder::BuildCheckMaps(
         {object}, merger.intersect_set(), GetCheckType(known_info->type())));
   } else if (map) {
     RETURN_IF_ABORT(AddNewNode<CheckMapsWithAlreadyLoadedMap>(
-        {object, *map}, merger.intersect_set()));
+        {object, *map}, merger.intersect_set(),
+        GetCheckType(known_info->type())));
   } else {
     RETURN_IF_ABORT(AddNewNode<CheckMaps>({object}, merger.intersect_set(),
                                           GetCheckType(known_info->type())));
@@ -4397,7 +4297,8 @@ ReduceResult MaglevGraphBuilder::BuildCompareMaps(
     std::optional<MaglevSubGraphBuilder::Label>& if_not_matched,
     std::optional<int> future_bind_offset) {
   GetOrCreateInfoFor(object);
-  KnownMapsMerger merger(broker(), zone(), maps);
+  KnownMapsMerger<base::Vector<const compiler::MapRef>> merger(broker(), zone(),
+                                                               maps);
   merger.IntersectWithKnownNodeAspects(object, known_node_aspects());
 
   if (merger.intersect_set().is_empty()) {
@@ -4520,7 +4421,7 @@ bool MaglevGraphBuilder::CanElideWriteBarrier(ValueNode* object,
   // a Smi when tagged.
   NodeInfo* node_info = GetOrCreateInfoFor(value);
   if (ValueNode* tagged_alt = node_info->alternative().tagged()) {
-    DCHECK(tagged_alt->properties().is_conversion());
+    DCHECK(tagged_alt->is_conversion());
     return CheckType(tagged_alt, NodeType::kSmi);
   }
   return false;
@@ -4531,9 +4432,22 @@ ValueNode* MaglevGraphBuilder::ConvertForField(ValueNode* value,
                                                AllocationType allocation_type) {
   switch (desc.type) {
     case vobj::FieldType::kTagged: {
-      if (value->Is<Float64Constant>() &&
-          !NodeTypeIs(GetType(value), NodeType::kSmi)) {
-        // Note that NodeType::kSmi MUST go through GetTaggedValue for proper
+      // Subtle: we don't use `NodeTypeIs(...)` since the predicate must NOT
+      // be true for NodeType::kNone.
+      // TODO(jgruber): NodeType::kNone should never reach here.
+      if (GetType(value) == NodeType::kSmi) {
+        // TODO(jgruber): This is needed because HoleyFloat64ToTagged does not
+        // canonicalize smis by default in GetTaggedValue. We rely on
+        // canonicalization though in TryReduceConstructArrayConstructor.
+        // We should make this more robust.
+        // TODO(454485895): Consider removing this workaround since
+        // HoleyFloat64ToTagged now canonicalizes by default.
+        MaybeReduceResult res = GetSmiValue(value);
+        CHECK(res.IsDoneWithValue());
+        return res.value();
+      }
+      if (value->Is<Float64Constant>()) {
+        // Note that NodeType::kSmi MUST go through GetSmiValue for proper
         // canonicalization. If we see a Float64Constant with type kSmi, it has
         // passed BuildCheckSmi, i.e. the runtime value is guaranteed to be
         // convertible to smi (we would have deoptimized otherwise).
@@ -4551,13 +4465,12 @@ ValueNode* MaglevGraphBuilder::ConvertForField(ValueNode* value,
       DCHECK(value->Is<TrustedConstant>());
       return value;
     case vobj::FieldType::kInt32:
+      // TODO(jgruber): Add conversions here once needed.
       DCHECK_EQ(value->properties().value_representation(),
                 ValueRepresentation::kInt32);
       return value;
     case vobj::FieldType::kFloat64:
-      DCHECK_EQ(value->properties().value_representation(),
-                ValueRepresentation::kFloat64);
-      return value;
+      return GetFloat64(value);
     case vobj::FieldType::kNone:
       UNREACHABLE();
   }
@@ -4760,21 +4673,20 @@ void MaglevGraphBuilder::TryBuildStoreTaggedFieldToAllocation(ValueNode* object,
 
 ReduceResult MaglevGraphBuilder::BuildStoreTaggedField(
     ValueNode* object, ValueNode* value, int offset, StoreTaggedMode store_mode,
-    Node** store) {
+    PropertyKey property_key) {
   // The value may be used to initialize a VO, which can leak to IFS.
   // It should NOT be a conversion node, UNLESS it's an initializing value.
   // Initializing values are tagged before allocation, since conversion nodes
   // may allocate, and are not used to set a VO.
   DCHECK_IMPLIES(store_mode != StoreTaggedMode::kInitializing,
-                 !value->properties().is_conversion());
+                 !value->is_conversion());
   // TODO(marja): Bail out if `value` has the empty type.
   if (store_mode != StoreTaggedMode::kInitializing) {
     TryBuildStoreTaggedFieldToAllocation(object, value, offset);
   }
-  Node* store_node;
   if (CanElideWriteBarrier(object, value)) {
-    GET_NODE_OR_ABORT(store_node, AddNewNode<StoreTaggedFieldNoWriteBarrier>(
-                                      {object, value}, offset, store_mode));
+    return AddNewNode<StoreTaggedFieldNoWriteBarrier>({object, value}, offset,
+                                                      store_mode, property_key);
   } else {
     // Detect stores that would create old-to-new references and pretenure the
     // value.
@@ -4786,37 +4698,27 @@ ReduceResult MaglevGraphBuilder::BuildStoreTaggedField(
         }
       }
     }
-    GET_NODE_OR_ABORT(store_node,
-                      AddNewNode<StoreTaggedFieldWithWriteBarrier>(
-                          {object, value}, offset, store_mode,
-                          NodeTypeCanBe(GetType(value), NodeType::kSmi)));
+    return AddNewNode<StoreTaggedFieldWithWriteBarrier>(
+        {object, value}, offset, store_mode,
+        NodeTypeCanBe(GetType(value), NodeType::kSmi), property_key);
   }
-  if (store) {
-    *store = store_node;
-  }
-  return ReduceResult::Done();
 }
 
 ReduceResult MaglevGraphBuilder::BuildStoreTaggedFieldNoWriteBarrier(
     ValueNode* object, ValueNode* value, int offset, StoreTaggedMode store_mode,
-    Node** store) {
+    PropertyKey property_key) {
   // The value may be used to initialize a VO, which can leak to IFS.
   // It should NOT be a conversion node, UNLESS it's an initializing value.
   // Initializing values are tagged before allocation, since conversion nodes
   // may allocate, and are not used to set a VO.
   DCHECK_IMPLIES(store_mode != StoreTaggedMode::kInitializing,
-                 !value->properties().is_conversion());
+                 !value->is_conversion());
   DCHECK(CanElideWriteBarrier(object, value));
   if (store_mode != StoreTaggedMode::kInitializing) {
     TryBuildStoreTaggedFieldToAllocation(object, value, offset);
   }
-  Node* store_node;
-  GET_NODE_OR_ABORT(store_node, AddNewNode<StoreTaggedFieldNoWriteBarrier>(
-                                    {object, value}, offset, store_mode));
-  if (store) {
-    *store = store_node;
-  }
-  return ReduceResult::Done();
+  return AddNewNode<StoreTaggedFieldNoWriteBarrier>({object, value}, offset,
+                                                    store_mode, property_key);
 }
 
 ReduceResult MaglevGraphBuilder::BuildStoreTrustedPointerField(
@@ -4831,7 +4733,8 @@ ReduceResult MaglevGraphBuilder::BuildStoreTrustedPointerField(
 }
 
 ReduceResult MaglevGraphBuilder::BuildLoadFixedArrayElement(ValueNode* elements,
-                                                            int index) {
+                                                            int index,
+                                                            LoadType type) {
   // We won't try to reason about the type of the elements array and thus also
   // cannot end up with an empty type for it.
   DCHECK(!IsEmptyNodeType(GetType(elements)));
@@ -4865,14 +4768,15 @@ ReduceResult MaglevGraphBuilder::BuildLoadFixedArrayElement(ValueNode* elements,
     return BuildAbort(AbortReason::kUnreachable);
   }
   return AddNewNodeNoInputConversion<LoadTaggedField>(
-      {elements}, FixedArray::OffsetOfElementAt(index), LoadType::kUnknown);
+      {elements}, FixedArray::OffsetOfElementAt(index), type, false,
+      PropertyKey::None());
 }
 
 ReduceResult MaglevGraphBuilder::BuildLoadFixedArrayElement(ValueNode* elements,
                                                             ValueNode* index,
                                                             LoadType type) {
   if (auto constant = TryGetInt32Constant(index)) {
-    return BuildLoadFixedArrayElement(elements, constant.value());
+    return BuildLoadFixedArrayElement(elements, constant.value(), type);
   }
   return AddNewNode<LoadFixedArrayElement>({elements, index}, type);
 }
@@ -4908,12 +4812,7 @@ ReduceResult MaglevGraphBuilder::BuildLoadFixedDoubleArrayElement(
         TryGetUint32Constant(vobject->get(FixedArrayBase::kLengthOffset));
     if (length.has_value()) {
       if (static_cast<uint32_t>(index) < length.value()) {
-        ValueNode* value =
-            vobject->get(FixedDoubleArray::OffsetOfElementAt(index));
-        static_assert(
-            VirtualFixedDoubleArrayShape::kElementsAreFloat64Constant);
-        DCHECK(value->Is<Float64Constant>());
-        return value;
+        return vobject->get(FixedDoubleArray::OffsetOfElementAt(index));
       } else {
         return BuildAbort(AbortReason::kUnreachable);
       }
@@ -4933,8 +4832,15 @@ ReduceResult MaglevGraphBuilder::BuildLoadFixedDoubleArrayElement(
 }
 
 ReduceResult MaglevGraphBuilder::BuildStoreFixedDoubleArrayElement(
-    ValueNode* elements, ValueNode* index, ValueNode* value) {
+    ElementsKind elements_kind, ValueNode* elements, ValueNode* index,
+    ValueNode* value) {
   // TODO(victorgomes): Support storing double element to a virtual object.
+  if (value->value_representation() == ValueRepresentation::kHoleyFloat64) {
+    DCHECK_EQ(elements_kind, HOLEY_DOUBLE_ELEMENTS);
+    return AddNewNode<StoreFixedHoleyDoubleArrayElement>(
+        {elements, index, value});
+  }
+  DCHECK_EQ(value->value_representation(), ValueRepresentation::kFloat64);
   return AddNewNode<StoreFixedDoubleArrayElement>({elements, index, value});
 }
 
@@ -5090,6 +4996,27 @@ MaybeReduceResult MaglevGraphBuilder::TryBuildPropertySetterCall(
   return ReduceResult::Done();
 }
 
+namespace {
+bool AccessInfoGuaranteedConst(
+    compiler::PropertyAccessInfo const& access_info) {
+  if (!access_info.IsFastDataConstant() && !access_info.IsStringLength()) {
+    return false;
+  }
+
+  // Even if we have a constant load, if the map is not stable, we cannot
+  // guarantee that the load is preserved across side-effecting calls.
+  // TODO(v8:7700): It might be possible to track it as const if we know
+  // that we're still on the main transition tree; and if we add a
+  // dependency on the stable end-maps of the entire tree.
+  for (auto& map : access_info.lookup_start_object_maps()) {
+    if (!map.is_stable()) {
+      return false;
+    }
+  }
+  return true;
+}
+}  // namespace
+
 ReduceResult MaglevGraphBuilder::BuildLoadField(
     compiler::PropertyAccessInfo const& access_info,
     ValueNode* lookup_start_object, compiler::NameRef name) {
@@ -5129,16 +5056,18 @@ ReduceResult MaglevGraphBuilder::BuildLoadField(
   // Do the load.
   if (field_index.is_double()) {
     ValueNode* heap_number;
-    GET_VALUE_OR_ABORT(heap_number, AddNewNode<LoadTaggedField>(
-                                        {load_source}, field_index.offset(),
-                                        LoadType::kHeapNumber));
+    GET_VALUE_OR_ABORT(heap_number,
+                       AddNewNode<LoadTaggedField>(
+                           {load_source}, field_index.offset(),
+                           LoadType::kHeapNumber, false, PropertyKey::None()));
     return AddNewNode<LoadFloat64>(
         {heap_number}, static_cast<int>(offsetof(HeapNumber, value_)));
   }
   ValueNode* value;
-  GET_VALUE_OR_ABORT(
-      value, BuildLoadTaggedField<LoadTaggedFieldForProperty>(
-                 load_source, field_index.offset(), LoadType::kUnknown, name));
+  GET_VALUE_OR_ABORT(value,
+                     BuildLoadTaggedField(
+                         load_source, field_index.offset(), LoadType::kUnknown,
+                         AccessInfoGuaranteedConst(access_info), name));
   // Insert stable field information if present.
   if (access_info.field_representation().IsSmi()) {
     NodeInfo* known_info = GetOrCreateInfoFor(value);
@@ -5183,12 +5112,30 @@ ReduceResult MaglevGraphBuilder::BuildLoadJSArrayLength(ValueNode* js_array,
   }
 
   ValueNode* length;
-  GET_VALUE_OR_ABORT(length, BuildLoadTaggedField<LoadTaggedFieldForProperty>(
+  GET_VALUE_OR_ABORT(length, BuildLoadTaggedField(
                                  js_array, JSArray::kLengthOffset, length_type,
-                                 broker()->length_string()));
+                                 false, broker()->length_string()));
   RecordKnownProperty(js_array, broker()->length_string(), length, false,
                       compiler::AccessMode::kLoad);
   return length;
+}
+
+ReduceResult MaglevGraphBuilder::BuildLoadJSDataViewByteLength(
+    ValueNode* js_data_view) {
+  // Note: We can't use broker()->byte_length_string() here, because it could
+  // conflict with redefinitions of the ArrayBufferView byteLength property.
+  if (ValueNode* byte_length =
+          known_node_aspects().TryFindLoadedConstantProperty(
+              js_data_view, PropertyKey::ArrayBufferViewByteLength())) {
+    return byte_length;
+  }
+
+  ValueNode* result;
+  GET_VALUE_OR_ABORT(result,
+                     AddNewNode<LoadDataViewByteLength>({js_data_view}));
+  RecordKnownProperty(js_data_view, PropertyKey::ArrayBufferViewByteLength(),
+                      result, true, compiler::AccessMode::kLoad);
+  return result;
 }
 
 ReduceResult MaglevGraphBuilder::BuildLoadJSFunctionFeedbackCell(
@@ -5247,7 +5194,7 @@ ReduceResult MaglevGraphBuilder::BuildExtendPropertiesBackingStore(
 
 MaybeReduceResult MaglevGraphBuilder::TryBuildStoreField(
     compiler::PropertyAccessInfo const& access_info, ValueNode* receiver,
-    compiler::AccessMode access_mode) {
+    compiler::AccessMode access_mode, compiler::NameRef name) {
   FieldIndex field_index = access_info.field_index();
   Representation field_representation = access_info.field_representation();
 
@@ -5315,16 +5262,17 @@ MaybeReduceResult MaglevGraphBuilder::TryBuildStoreField(
       ValueNode* heapnumber_value;
       GET_VALUE_OR_ABORT(heapnumber_value,
                          AddNewNode<Float64ToHeapNumberForField>({value}));
-      RETURN_IF_ABORT(BuildStoreTaggedField(store_target, heapnumber_value,
-                                            field_index.offset(),
-                                            StoreTaggedMode::kTransitioning));
+      RETURN_IF_ABORT(BuildStoreTaggedField(
+          store_target, heapnumber_value, field_index.offset(),
+          StoreTaggedMode::kTransitioning, name));
       return BuildStoreMap(receiver, access_info.transition_map().value(),
                            StoreMap::Kind::kTransitioning);
     } else {
       ValueNode* heap_number;
-      GET_VALUE_OR_ABORT(heap_number, AddNewNode<LoadTaggedField>(
-                                          {store_target}, field_index.offset(),
-                                          LoadType::kHeapNumber));
+      GET_VALUE_OR_ABORT(
+          heap_number, AddNewNode<LoadTaggedField>(
+                           {store_target}, field_index.offset(),
+                           LoadType::kHeapNumber, false, PropertyKey::None()));
       return AddNewNode<StoreFloat64>(
           {heap_number, value}, static_cast<int>(offsetof(HeapNumber, value_)));
     }
@@ -5336,12 +5284,12 @@ MaybeReduceResult MaglevGraphBuilder::TryBuildStoreField(
                                    : StoreTaggedMode::kDefault;
   if (field_representation.IsSmi()) {
     RETURN_IF_ABORT(BuildStoreTaggedFieldNoWriteBarrier(
-        store_target, value, field_index.offset(), store_mode));
+        store_target, value, field_index.offset(), store_mode, name));
   } else {
     DCHECK(field_representation.IsHeapObject() ||
            field_representation.IsTagged());
-    RETURN_IF_ABORT(BuildStoreTaggedField(store_target, value,
-                                          field_index.offset(), store_mode));
+    RETURN_IF_ABORT(BuildStoreTaggedField(
+        store_target, value, field_index.offset(), store_mode, name));
   }
   if (access_info.HasTransitionMap()) {
     RETURN_IF_ABORT(BuildStoreMap(receiver,
@@ -5351,27 +5299,6 @@ MaybeReduceResult MaglevGraphBuilder::TryBuildStoreField(
 
   return ReduceResult::Done();
 }
-
-namespace {
-bool AccessInfoGuaranteedConst(
-    compiler::PropertyAccessInfo const& access_info) {
-  if (!access_info.IsFastDataConstant() && !access_info.IsStringLength()) {
-    return false;
-  }
-
-  // Even if we have a constant load, if the map is not stable, we cannot
-  // guarantee that the load is preserved across side-effecting calls.
-  // TODO(v8:7700): It might be possible to track it as const if we know
-  // that we're still on the main transition tree; and if we add a
-  // dependency on the stable end-maps of the entire tree.
-  for (auto& map : access_info.lookup_start_object_maps()) {
-    if (!map.is_stable()) {
-      return false;
-    }
-  }
-  return true;
-}
-}  // namespace
 
 MaybeReduceResult MaglevGraphBuilder::TryBuildPropertyLoad(
     ValueNode* receiver, ValueNode* lookup_start_object, compiler::NameRef name,
@@ -5409,8 +5336,8 @@ MaybeReduceResult MaglevGraphBuilder::TryBuildPropertyLoad(
                                         lookup_start_object);
     case compiler::PropertyAccessInfo::kModuleExport: {
       ValueNode* cell = GetConstant(access_info.constant().value().AsCell());
-      return BuildLoadTaggedField<LoadTaggedFieldForProperty>(
-          cell, Cell::kValueOffset, LoadType::kUnknown, name);
+      return BuildLoadTaggedField(cell, Cell::kValueOffset, LoadType::kUnknown,
+                                  false, name);
     }
     case compiler::PropertyAccessInfo::kStringLength: {
       DCHECK_EQ(receiver, lookup_start_object);
@@ -5463,7 +5390,7 @@ MaybeReduceResult MaglevGraphBuilder::TryBuildPropertyStore(
     case compiler::PropertyAccessInfo::kDataField:
     case compiler::PropertyAccessInfo::kFastDataConstant: {
       MaybeReduceResult res =
-          TryBuildStoreField(access_info, receiver, access_mode);
+          TryBuildStoreField(access_info, receiver, access_mode, name);
       if (res.IsDone()) {
         RecordKnownProperty(
             receiver, name, current_interpreter_frame_.accumulator(),
@@ -5564,7 +5491,8 @@ MaybeReduceResult MaglevGraphBuilder::TryBuildNamedAccess(
   } else {
     // TODO(leszeks): This is doing duplicate work with BuildCheckMaps,
     // consider passing the merger into there.
-    KnownMapsMerger merger(broker(), zone(), base::VectorOf(feedback.maps()));
+    KnownMapsMerger<ZoneVector<compiler::MapRef>> merger(broker(), zone(),
+                                                         feedback.maps());
     merger.IntersectWithKnownNodeAspects(lookup_start_object,
                                          known_node_aspects());
     inferred_maps = merger.intersect_set();
@@ -5664,6 +5592,7 @@ ReduceResult MaglevGraphBuilder::GetInt32ElementIndex(ValueNode* object) {
     case ValueRepresentation::kUint32:
     case ValueRepresentation::kFloat64:
     case ValueRepresentation::kHoleyFloat64:
+    case ValueRepresentation::kShiftedInt53:
       return GetInt32(object);
     case ValueRepresentation::kNone:
       UNREACHABLE();
@@ -5677,8 +5606,6 @@ ReduceResult MaglevGraphBuilder::GetUint32ElementIndex(ValueNode* object) {
   // GetInt32ElementIndex, making this an Int32 Phi use.
 
   switch (object->properties().value_representation()) {
-    case ValueRepresentation::kIntPtr:
-      return AddNewNodeNoInputConversion<CheckedIntPtrToUint32>({object});
     case ValueRepresentation::kTagged: {
       // TODO(victorgomes): Consider creating a CheckedObjectToUnsignedIndex.
       if (SmiConstant* constant = object->TryCast<SmiConstant>()) {
@@ -5692,6 +5619,7 @@ ReduceResult MaglevGraphBuilder::GetUint32ElementIndex(ValueNode* object) {
       GET_VALUE_OR_ABORT(index, GetInt32ElementIndex(object));
       return AddNewNodeNoInputConversion<CheckedInt32ToUint32>({index});
     }
+
     case ValueRepresentation::kInt32:
       if (auto constant = TryGetInt32Constant(object)) {
         if (*constant < 0) {
@@ -5700,13 +5628,19 @@ ReduceResult MaglevGraphBuilder::GetUint32ElementIndex(ValueNode* object) {
         return GetUint32Constant(*constant);
       }
       return AddNewNodeNoInputConversion<CheckedInt32ToUint32>({object});
+
     case ValueRepresentation::kUint32:
       return object;
+
+    case ValueRepresentation::kShiftedInt53:
+      return AddNewNodeNoInputConversion<CheckedShiftedInt53ToUint32>({object});
     case ValueRepresentation::kFloat64:
-      if (auto constant = TryGetFloat64Constant(
-              object, TaggedToFloat64ConversionType::kOnlyNumber)) {
+      if (auto constant = TryGetFloat64OrHoleyFloat64Constant(
+              UseRepresentation::kFloat64, object,
+              TaggedToFloat64ConversionType::kOnlyNumber)) {
         uint32_t uint32_value;
-        if (!DoubleToUint32IfEqualToSelf(*constant, &uint32_value)) {
+        if (!DoubleToUint32IfEqualToSelf(constant->get_scalar(),
+                                         &uint32_value)) {
           return EmitUnconditionalDeopt(DeoptimizeReason::kNotUint32);
         }
         if (Smi::IsValid(uint32_value)) {
@@ -5714,12 +5648,11 @@ ReduceResult MaglevGraphBuilder::GetUint32ElementIndex(ValueNode* object) {
         }
       }
       [[fallthrough]];
-    case ValueRepresentation::kHoleyFloat64: {
-      // CheckedHoleyFloat64ToUint32 will gracefully deopt on holes.
-      return AddNewNodeNoInputConversion<CheckedHoleyFloat64ToUint32>({object});
-      case ValueRepresentation::kNone:
-        UNREACHABLE();
-    }
+
+    case ValueRepresentation::kHoleyFloat64:
+    case ValueRepresentation::kNone:
+    case ValueRepresentation::kIntPtr:
+      UNREACHABLE();
   }
 }
 
@@ -5864,7 +5797,7 @@ ReduceResult MaglevGraphBuilder::TryBuildCheckInt32Condition(
 
 ReduceResult MaglevGraphBuilder::BuildLoadElements(ValueNode* object) {
   ValueNode* known_elements = known_node_aspects().TryFindLoadedProperty(
-      object, KnownNodeAspects::LoadedPropertyMapKey::Elements());
+      object, PropertyKey::Elements());
   if (known_elements) {
     TRACE("  * Reusing non-constant [Elements] "
           << PrintNodeLabel(known_elements) << ": "
@@ -5876,9 +5809,8 @@ ReduceResult MaglevGraphBuilder::BuildLoadElements(ValueNode* object) {
   ValueNode* elements;
   GET_VALUE_OR_ABORT(elements,
                      BuildLoadTaggedField(object, JSObject::kElementsOffset));
-  RecordKnownProperty(object,
-                      KnownNodeAspects::LoadedPropertyMapKey::Elements(),
-                      elements, false, compiler::AccessMode::kLoad);
+  RecordKnownProperty(object, PropertyKey::Elements(), elements, false,
+                      compiler::AccessMode::kLoad);
   return elements;
 }
 
@@ -5907,8 +5839,7 @@ ReduceResult MaglevGraphBuilder::BuildLoadTypedArrayLength(
     // conflict with redefinitions of the TypedArray length property.
 
     if (ValueNode* length = known_node_aspects().TryFindLoadedConstantProperty(
-            object,
-            KnownNodeAspects::LoadedPropertyMapKey::TypedArrayLength())) {
+            object, PropertyKey::TypedArrayLength())) {
       return length;
     }
   }
@@ -5917,9 +5848,8 @@ ReduceResult MaglevGraphBuilder::BuildLoadTypedArrayLength(
   GET_VALUE_OR_ABORT(result,
                      AddNewNode<LoadTypedArrayLength>({object}, elements_kind));
   if (!is_variable_length) {
-    RecordKnownProperty(
-        object, KnownNodeAspects::LoadedPropertyMapKey::TypedArrayLength(),
-        result, true, compiler::AccessMode::kLoad);
+    RecordKnownProperty(object, PropertyKey::TypedArrayLength(), result, true,
+                        compiler::AccessMode::kLoad);
   }
   return result;
 }
@@ -6000,8 +5930,8 @@ ReduceResult MaglevGraphBuilder::BuildStoreTypedArrayElement(
       break;
     case FLOAT32_ELEMENTS:
     case FLOAT64_ELEMENTS:
-      BUILD_STORE_TYPED_ARRAY(Double, GetAccumulatorHoleyFloat64ForToNumber(
-                                          NodeType::kNumberOrOddball))
+      BUILD_STORE_TYPED_ARRAY(
+          Double, GetAccumulatorFloat64ForToNumber(NodeType::kNumberOrOddball))
       break;
     default:
       UNREACHABLE();
@@ -6039,8 +5969,7 @@ ReduceResult MaglevGraphBuilder::BuildStoreConstantTypedArrayElement(
     case FLOAT32_ELEMENTS:
     case FLOAT64_ELEMENTS:
       BUILD_STORE_CONSTANT_TYPED_ARRAY(
-          Double,
-          GetAccumulatorHoleyFloat64ForToNumber(NodeType::kNumberOrOddball))
+          Double, GetAccumulatorFloat64ForToNumber(NodeType::kNumberOrOddball))
       break;
     default:
       UNREACHABLE();
@@ -6200,10 +6129,11 @@ ReduceResult MaglevGraphBuilder::ConvertForStoring(ValueNode* value,
 #ifdef V8_ENABLE_UNDEFINED_DOUBLE
     if (kind == ElementsKind::HOLEY_DOUBLE_ELEMENTS) {
       value->MaybeRecordUseReprHint(UseRepresentation::kHoleyFloat64);
-      const bool convert_hole_to_undefined = true;
-      return GetHoleyFloat64(value,
-                             TaggedToFloat64ConversionType::kNumberOrUndefined,
-                             convert_hole_to_undefined);
+      ValueNode* value_hf64 = GetHoleyFloat64(value);
+      // We still have to convert hole nans to undefined nans for storing.
+      GET_VALUE_OR_ABORT(
+          value, AddNewNode<HoleyFloat64ConvertHoleToUndefined>({value_hf64}));
+      return value;
     }
 #endif  // V8_ENABLE_UNDEFINED_DOUBLE
     // Make sure we do not store signalling NaNs into double arrays.
@@ -6213,6 +6143,43 @@ ReduceResult MaglevGraphBuilder::ConvertForStoring(ValueNode* value,
   }
   if (IsSmiElementsKind(kind)) return GetSmiValue(value);
   return value;
+}
+
+std::optional<int32_t> MaglevGraphBuilder::CanElideBoundCheckAndResizing(
+    ValueNode* elements_array, ValueNode* index_object, bool is_jsarray,
+    const compiler::KeyedAccessMode& keyed_mode) {
+  if (!is_jsarray) return {};
+
+  if (keyed_mode.access_mode() != compiler::AccessMode::kStoreInLiteral) {
+    // We get the length of the array from the vobj, but if the AccessMode is
+    // not kStoreInLiteral, then this store could be after the array has shrunk.
+    // StoreInLiteral is only used for initializing stores, so there shouldn't
+    // be anything in between the allocation and here to shrink the array.
+    return {};
+  }
+
+  if (keyed_mode.store_mode() == KeyedAccessStoreMode::kHandleCOW) {
+    // TODO(dmercadier): we could handle this by still eliding the bounds check
+    // but simply calling EnsureWritableElements. However, this currently
+    // doesn't seem to ever happen, but it should happen if we improve load
+    // elimination.
+    return {};
+  }
+
+  std::optional<int32_t> int32_index = TryGetInt32Constant(index_object);
+  if (!int32_index.has_value()) return {};
+
+  if (!elements_array->Is<InlinedAllocation>()) return {};
+  VirtualObject* vobj = elements_array->Cast<InlinedAllocation>()->object();
+
+  if (!vobj->map().IsJSArrayMap()) return {};
+
+  SmiConstant* array_length =
+      vobj->get(JSArray::kLengthOffset)->TryCast<SmiConstant>();
+  if (!array_length) return {};
+
+  if (array_length->value().value() <= *int32_index) return {};
+  return int32_index;
 }
 
 MaybeReduceResult MaglevGraphBuilder::TryBuildElementStoreOnJSArrayOrJSObject(
@@ -6228,15 +6195,11 @@ MaybeReduceResult MaglevGraphBuilder::TryBuildElementStoreOnJSArrayOrJSObject(
   ValueNode* elements_array;
   GET_VALUE_OR_ABORT(elements_array, BuildLoadElements(object));
   GET_VALUE_OR_ABORT(value, ConvertForStoring(value, elements_kind));
-  ValueNode* index;
+  ValueNode* index = nullptr;
 
-  // TODO(verwaest): Loop peeling will turn the first iteration index of spread
-  // literals into smi constants as well, breaking the assumption that we'll
-  // have preallocated the space if we see known indices. Turn off this
-  // optimization if loop peeling is on.
-  if (keyed_mode.access_mode() == compiler::AccessMode::kStoreInLiteral &&
-      index_object->Is<SmiConstant>() && is_jsarray && !any_peeled_loop_) {
-    GET_VALUE_OR_ABORT(index, GetInt32ElementIndex(index_object));
+  if (std::optional<int32_t> int32_index = CanElideBoundCheckAndResizing(
+          object, index_object, is_jsarray, keyed_mode)) {
+    index = GetInt32Constant(*int32_index);
   } else {
     // Check boundaries.
     ValueNode* elements_array_length = nullptr;
@@ -6328,7 +6291,8 @@ MaybeReduceResult MaglevGraphBuilder::TryBuildElementStoreOnJSArrayOrJSObject(
 
   // Do the store.
   if (IsDoubleElementsKind(elements_kind)) {
-    return BuildStoreFixedDoubleArrayElement(elements_array, index, value);
+    return BuildStoreFixedDoubleArrayElement(elements_kind, elements_array,
+                                             index, value);
   } else {
     return BuildStoreFixedArrayElement(elements_array, index, value);
   }
@@ -6442,6 +6406,16 @@ MaybeReduceResult MaglevGraphBuilder::TryBuildElementAccess(
     }
     for (compiler::MapRef prototype_map : prototype_maps) {
       broker()->dependencies()->DependOnStableMap(prototype_map);
+    }
+  }
+
+  // Do not optimize AccessMode::kDefine for typed arrays.
+  if (keyed_mode.access_mode() == compiler::AccessMode::kDefine) {
+    for (const compiler::ElementAccessInfo& access_info : access_infos) {
+      if (IsTypedArrayOrRabGsabTypedArrayElementsKind(
+              access_info.elements_kind())) {
+        return {};
+      }
     }
   }
 
@@ -6664,7 +6638,8 @@ MaybeReduceResult MaglevGraphBuilder::TryBuildPolymorphicPropertyAccess(
       if (map.IsHeapNumberMap()) {
         GetOrCreateInfoFor(lookup_start_object);
         base::SmallVector<compiler::MapRef, 1> known_maps = {map};
-        KnownMapsMerger merger(broker(), zone(), base::VectorOf(known_maps));
+        KnownMapsMerger<base::SmallVector<compiler::MapRef, 1>> merger(
+            broker(), zone(), known_maps);
         merger.IntersectWithKnownNodeAspects(lookup_start_object,
                                              known_node_aspects());
         if (!merger.intersect_set().is_empty() &&
@@ -6744,7 +6719,7 @@ MaybeReduceResult MaglevGraphBuilder::TryBuildPolymorphicPropertyAccess(
     const auto& maps = access_info.lookup_start_object_maps();
     if (i == access_info_count - 1) {
       map_check_result = BuildCheckMaps(
-          lookup_start_object, base::VectorOf(maps), {},
+          lookup_start_object, base::VectorOf(maps), lookup_start_object_map,
           has_deprecated_map_without_migration_target, needs_migration);
     } else {
       std::optional<int> future_bind_offset;
@@ -7112,10 +7087,11 @@ void MaglevGraphBuilder::AdvanceThroughContinuationForPolymorphicPropertyLoad(
   }
 }
 
-void MaglevGraphBuilder::RecordKnownProperty(
-    ValueNode* lookup_start_object, KnownNodeAspects::LoadedPropertyMapKey key,
-    ValueNode* value, bool is_const, compiler::AccessMode access_mode) {
-  DCHECK(!value->properties().is_conversion());
+void MaglevGraphBuilder::RecordKnownProperty(ValueNode* lookup_start_object,
+                                             PropertyKey key, ValueNode* value,
+                                             bool is_const,
+                                             compiler::AccessMode access_mode) {
+  DCHECK(!value->is_conversion());
   auto& props_for_key =
       known_node_aspects().GetLoadedPropertiesForKey(zone(), is_const, key);
   if (!is_const && IsAnyStore(access_mode)) {
@@ -7130,22 +7106,8 @@ void MaglevGraphBuilder::RecordKnownProperty(
     // whether there's an intersection of known maps.
     if (V8_UNLIKELY(v8_flags.trace_maglev_graph_building &&
                     is_tracing_enabled())) {
-      std::cout << "  * Removing all non-constant cached ";
-      switch (key.type()) {
-        case KnownNodeAspects::LoadedPropertyMapKey::kName:
-          std::cout << "properties with name " << *key.name().object();
-          break;
-        case KnownNodeAspects::LoadedPropertyMapKey::kElements:
-          std::cout << "Elements";
-          break;
-        case KnownNodeAspects::LoadedPropertyMapKey::kTypedArrayLength:
-          std::cout << "TypedArray length";
-          break;
-        case KnownNodeAspects::LoadedPropertyMapKey::kStringLength:
-          std::cout << "String length";
-          break;
-      }
-      std::cout << std::endl;
+      std::cout << "  * Removing all non-constant cached properties with "
+                << key << std::endl;
     }
     props_for_key.clear();
   }
@@ -7154,22 +7116,8 @@ void MaglevGraphBuilder::RecordKnownProperty(
                   is_tracing_enabled())) {
     std::cout << "  * Recording " << (is_const ? "constant" : "non-constant")
               << " known property " << PrintNodeLabel(lookup_start_object)
-              << ": " << PrintNode(lookup_start_object) << " [";
-    switch (key.type()) {
-      case KnownNodeAspects::LoadedPropertyMapKey::kName:
-        std::cout << *key.name().object();
-        break;
-      case KnownNodeAspects::LoadedPropertyMapKey::kElements:
-        std::cout << "Elements";
-        break;
-      case KnownNodeAspects::LoadedPropertyMapKey::kTypedArrayLength:
-        std::cout << "TypedArray length";
-        break;
-      case KnownNodeAspects::LoadedPropertyMapKey::kStringLength:
-        std::cout << "String length";
-        break;
-    }
-    std::cout << "] = " << PrintNodeLabel(value) << ": " << PrintNode(value)
+              << ": " << PrintNode(lookup_start_object) << " [" << key
+              << "] = " << PrintNodeLabel(value) << ": " << PrintNode(value)
               << std::endl;
   }
 
@@ -7218,16 +7166,15 @@ ReduceResult MaglevGraphBuilder::BuildLoadStringLength(ValueNode* string) {
   }
   if (ValueNode* const_length =
           known_node_aspects().TryFindLoadedConstantProperty(
-              string, KnownNodeAspects::LoadedPropertyMapKey::StringLength())) {
+              string, PropertyKey::StringLength())) {
     TRACE("  * Reusing constant [String length]"
           << PrintNodeLabel(const_length) << ": " << PrintNode(const_length));
     return const_length;
   }
   ValueNode* result;
   GET_VALUE_OR_ABORT(result, AddNewNode<StringLength>({string}));
-  RecordKnownProperty(string,
-                      KnownNodeAspects::LoadedPropertyMapKey::StringLength(),
-                      result, true, compiler::AccessMode::kLoad);
+  RecordKnownProperty(string, PropertyKey::StringLength(), result, true,
+                      compiler::AccessMode::kLoad);
   return result;
 }
 
@@ -7662,9 +7609,46 @@ ReduceResult MaglevGraphBuilder::VisitDefineNamedOwnProperty() {
   return build_generic_access();
 }
 
+ReduceResult MaglevGraphBuilder::BuildSetKeyedProperty(
+    ValueNode* object, ValueNode* index, compiler::AccessMode access_mode,
+    const compiler::FeedbackSource& feedback_source,
+    const compiler::ProcessedFeedback& processed_feedback,
+    base::FunctionRef<ReduceResult()> generic_setter) {
+  switch (processed_feedback.kind()) {
+    case compiler::ProcessedFeedback::kInsufficient:
+      return EmitUnconditionalDeopt(
+          DeoptimizeReason::kInsufficientTypeFeedbackForGenericKeyedAccess);
+
+    case compiler::ProcessedFeedback::kNamedAccess: {
+      RETURN_IF_ABORT(BuildCheckInternalizedStringValueOrByReference(
+          index, processed_feedback.AsNamedAccess().original_name_maybe_thin(),
+          DeoptimizeReason::kKeyedAccessChanged));
+
+      RETURN_IF_DONE(TryBuildNamedAccess(
+          object, object, processed_feedback.AsNamedAccess(), feedback_source,
+          access_mode, generic_setter));
+      break;
+    }
+
+    case compiler::ProcessedFeedback::kElementAccess: {
+      RETURN_IF_DONE(TryBuildElementAccess(object, index,
+                                           processed_feedback.AsElementAccess(),
+                                           feedback_source, generic_setter));
+      break;
+    }
+
+    default:
+      break;
+  }
+
+  // Create a generic store in the fallthrough.
+  return generic_setter();
+}
+
 ReduceResult MaglevGraphBuilder::VisitSetKeyedProperty() {
   // SetKeyedProperty <object> <key> <slot>
   ValueNode* object = LoadRegister(0);
+  ValueNode* key = LoadRegister(1);
   FeedbackSlot slot = GetSlotOperand(2);
   compiler::FeedbackSource feedback_source{feedback(), slot};
 
@@ -7672,52 +7656,40 @@ ReduceResult MaglevGraphBuilder::VisitSetKeyedProperty() {
       broker()->GetFeedbackForPropertyAccess(
           feedback_source, compiler::AccessMode::kStore, std::nullopt);
 
-  auto build_generic_access = [this, object, &feedback_source]() {
-    ValueNode* key = LoadRegister(1);
+  auto build_generic_access = [this, object, key, &feedback_source]() {
     ValueNode* context = GetContext();
     ValueNode* value = GetAccumulator();
     return AddNewNode<SetKeyedGeneric>({context, object, key, value},
                                        feedback_source);
   };
 
-  switch (processed_feedback.kind()) {
-    case compiler::ProcessedFeedback::kInsufficient:
-      return EmitUnconditionalDeopt(
-          DeoptimizeReason::kInsufficientTypeFeedbackForGenericKeyedAccess);
-
-    case compiler::ProcessedFeedback::kElementAccess: {
-      // Get the key without conversion. TryBuildElementAccess will try to pick
-      // the best representation.
-      ValueNode* index =
-          current_interpreter_frame_.get(iterator_.GetRegisterOperand(1));
-      RETURN_IF_DONE(TryBuildElementAccess(
-          object, index, processed_feedback.AsElementAccess(), feedback_source,
-          build_generic_access));
-    } break;
-
-    default:
-      break;
-  }
-
-  // Create a generic store in the fallthrough.
-  return build_generic_access();
+  return BuildSetKeyedProperty(object, key, compiler::AccessMode::kStore,
+                               feedback_source, processed_feedback,
+                               build_generic_access);
 }
 
 ReduceResult MaglevGraphBuilder::VisitDefineKeyedOwnProperty() {
   // DefineKeyedOwnProperty <object> <key> <flags> <slot>
   ValueNode* object = LoadRegister(0);
   ValueNode* key = LoadRegister(1);
-  ValueNode* flags = GetSmiConstant(GetFlag8Operand(2));
   FeedbackSlot slot = GetSlotOperand(3);
   compiler::FeedbackSource feedback_source{feedback(), slot};
 
-  // TODO(victorgomes): Add monomorphic fast path.
+  const compiler::ProcessedFeedback& processed_feedback =
+      broker()->GetFeedbackForPropertyAccess(
+          feedback_source, compiler::AccessMode::kDefine, std::nullopt);
 
-  // Create a generic store in the fallthrough.
-  ValueNode* context = GetContext();
-  ValueNode* value = GetAccumulator();
-  return AddNewNode<DefineKeyedOwnGeneric>({context, object, key, value, flags},
-                                           feedback_source);
+  auto build_generic_access = [this, object, key, &feedback_source]() {
+    ValueNode* context = GetContext();
+    ValueNode* value = GetAccumulator();
+    ValueNode* flags = GetSmiConstant(GetFlag8Operand(2));
+    return AddNewNode<DefineKeyedOwnGeneric>(
+        {context, object, key, value, flags}, feedback_source);
+  };
+
+  return BuildSetKeyedProperty(object, key, compiler::AccessMode::kDefine,
+                               feedback_source, processed_feedback,
+                               build_generic_access);
 }
 
 ReduceResult MaglevGraphBuilder::VisitStaInArrayLiteral() {
@@ -8116,7 +8088,8 @@ ReduceResult MaglevGraphBuilder::BuildInlineFunction(
 
   if (is_tracing_enabled()) {
     if (v8_flags.maglev_print_inlined && v8_flags.maglev_print_bytecode) {
-      std::cout << "== Inlining " << Brief(*shared.object()) << std::endl;
+      std::cout << "\n----- Inlining " << Brief(*shared.object())
+                << " with bytecode -----" << std::endl;
       BytecodeArray::Disassemble(bytecode.object(), std::cout);
       if (v8_flags.maglev_print_feedback) {
         i::Print(*feedback.object(), std::cout);
@@ -8294,7 +8267,7 @@ bool MaglevGraphBuilder::ShouldEagerInlineCall(
     return false;
   }
 
-  if (graph()->total_inlined_bytecode_size_small() >
+  if (graph()->total_inlined_bytecode_size_small() >=
       max_inlined_bytecode_size_small_total()) {
     compilation_unit_->info()->set_could_not_inline_all_candidates();
     TRACE_CANNOT_INLINE("maximum inlined bytecode size for small functions");
@@ -8318,9 +8291,7 @@ bool MaglevGraphBuilder::ShouldEagerInlineCall(
 
 MaybeReduceResult MaglevGraphBuilder::TryBuildInlineCall(
     ValueNode* context, ValueNode* function, ValueNode* new_target,
-#ifdef V8_ENABLE_LEAPTIERING
     JSDispatchHandle dispatch_handle,
-#endif
     compiler::SharedFunctionInfoRef shared,
     compiler::FeedbackCellRef feedback_cell, CallArguments& args,
     const compiler::FeedbackSource& feedback_source) {
@@ -8337,6 +8308,10 @@ MaybeReduceResult MaglevGraphBuilder::TryBuildInlineCall(
         broker()->GetFeedbackForCall(feedback_source);
     feedback_frequency =
         feedback.IsInsufficient() ? 0.0f : feedback.AsCall().frequency();
+  } else if (IsAccessorFunction(shared.kind()) && is_turbolev()) {
+    // Accessors don't have feedback since there's no CallIC. This allows
+    // inlining them in turbolev.
+    feedback_frequency = 1.0f;
   }
   float call_frequency = feedback_frequency * GetCurrentCallFrequency();
 
@@ -8358,6 +8333,18 @@ MaybeReduceResult MaglevGraphBuilder::TryBuildInlineCall(
                                            << ") > max_inline_depth ("
                                            << max_inline_depth() << ")");
     return {};
+  }
+
+  if (max_inline_depth() == 1) {
+    compiler::OptionalHeapObjectRef target_function = TryGetConstant(function);
+    if (target_function && target_function->IsJSFunction()) {
+      if (compiler::OptionalCodeRef code =
+              target_function->AsJSFunction().code(broker())) {
+        if (code->GetInlinedBytecodeSize()) {
+          return {};
+        }
+      }
+    }
   }
 
   if (!is_non_eager_inlining_enabled()) {
@@ -8385,9 +8372,7 @@ MaybeReduceResult MaglevGraphBuilder::TryBuildInlineCall(
   CallKnownJSFunction* generic_call;
   GET_VALUE_OR_ABORT(generic_call,
                      BuildCallKnownJSFunction(context, function, new_target,
-#ifdef V8_ENABLE_LEAPTIERING
                                               dispatch_handle,
-#endif
                                               shared, arguments));
 
   // Note: We point to the generic call exception handler instead of
@@ -9255,6 +9240,10 @@ MaybeReduceResult MaglevGraphBuilder::TryReduceArrayPrototypeSlice(
     return {};
   }
 
+  if (!CheckType(receiver, NodeType::kJSReceiver)) {
+    return {};
+  }
+
   auto possible_maps = known_node_aspects().TryGetPossibleMaps(receiver);
   if (!possible_maps) {
     return {};
@@ -9547,6 +9536,38 @@ MaybeReduceResult MaglevGraphBuilder::TryReduceStringPrototypeCodePointAt(
   return GetCodePointAt();
 }
 
+MaybeReduceResult MaglevGraphBuilder::TryReduceStringPrototypeSlice(
+    compiler::JSFunctionRef target, CallArguments& args) {
+  if (!CanSpeculateCall()) return {};
+  if (args.count() != 1) return {};
+
+  // Reduce slice(-1).
+  ValueNode* index = args[0];
+  std::optional<int32_t> index_const = TryGetInt32Constant(index);
+  if (!index_const || *index_const != -1) return {};
+
+  // Ensure that {receiver} is actually a String.
+  ValueNode* receiver = GetValueOrUndefined(args.receiver());
+  RETURN_IF_ABORT(BuildCheckString(receiver));
+
+  ValueNode* receiver_length;
+  GET_VALUE_OR_ABORT(receiver_length, BuildLoadStringLength(receiver));
+
+  return SelectReduction(
+      [&](BranchBuilder& builder) {
+        return BuildBranchIfInt32Compare(builder, Operation::kEqual,
+                                         receiver_length, GetInt32Constant(0));
+      },
+      [&] { return GetRootConstant(RootIndex::kempty_string); },
+      [&] {
+        ValueNode* index_last;
+        GET_VALUE_OR_ABORT(
+            index_last,
+            AddNewNode<Int32Subtract>({receiver_length, GetInt32Constant(1)}));
+        return AddNewNode<StringAt>({receiver, index_last});
+      });
+}
+
 MaybeReduceResult MaglevGraphBuilder::TryReduceStringPrototypeStartsWith(
     compiler::JSFunctionRef target, CallArguments& args) {
   if (!CanSpeculateCall()) return {};
@@ -9616,7 +9637,8 @@ MaybeReduceResult MaglevGraphBuilder::TryReduceStringPrototypeStartsWith(
   GET_VALUE_OR_ABORT(lhs_ch, BuildGetCharCodeAt(receiver, pos));
   ValueNode* rhs_ch;
   GET_VALUE_OR_ABORT(rhs_ch, BuildGetCharCodeAt(search_element, index_int32));
-  ValueNode* is_equal = BuildTaggedEqual(lhs_ch, rhs_ch);
+  ValueNode* is_equal;
+  GET_VALUE_OR_ABORT(is_equal, BuildTaggedEqual(lhs_ch, rhs_ch));
 
   // If chars are not equal, return false.
   sub_graph.GotoIfFalse<BranchIfRootConstant>(&return_false, {is_equal},
@@ -9735,11 +9757,12 @@ MaybeReduceResult MaglevGraphBuilder::TryBuildLoadDataView(
     // TODO(victorgomes): Add checks whether the array has been detached.
     return {};
   }
-  // TODO(victorgomes): Add data view to known types.
   ValueNode* receiver = GetValueOrUndefined(args.receiver());
-  RETURN_IF_ABORT(
-      AddNewNode<CheckInstanceType>({receiver}, CheckType::kCheckHeapObject,
-                                    JS_DATA_VIEW_TYPE, JS_DATA_VIEW_TYPE));
+  if (!EnsureType(receiver, NodeType::kJSDataView)) {
+    RETURN_IF_ABORT(
+        AddNewNode<CheckInstanceType>({receiver}, CheckType::kCheckHeapObject,
+                                      JS_DATA_VIEW_TYPE, JS_DATA_VIEW_TYPE));
+  }
   // TODO(v8:11111): Optimize for JS_RAB_GSAB_DATA_VIEW_TYPE too.
   ValueNode* offset;
   if (args[0]) {
@@ -9747,7 +9770,12 @@ MaybeReduceResult MaglevGraphBuilder::TryBuildLoadDataView(
   } else {
     offset = GetInt32Constant(0);
   }
-  RETURN_IF_ABORT(AddNewNode<CheckJSDataViewBounds>({receiver, offset}, type));
+
+  ValueNode* byte_length;
+  GET_VALUE_OR_ABORT(byte_length, BuildLoadJSDataViewByteLength(receiver));
+
+  RETURN_IF_ABORT(
+      AddNewNode<CheckJSDataViewBounds>({offset, byte_length}, type));
   ValueNode* is_little_endian = args[1] ? args[1] : GetBooleanConstant(false);
   return AddNewNode<LoadNode>({receiver, offset, is_little_endian}, type);
 }
@@ -9760,11 +9788,12 @@ MaybeReduceResult MaglevGraphBuilder::TryBuildStoreDataView(
     // TODO(victorgomes): Add checks whether the array has been detached.
     return {};
   }
-  // TODO(victorgomes): Add data view to known types.
   ValueNode* receiver = GetValueOrUndefined(args.receiver());
-  RETURN_IF_ABORT(
-      AddNewNode<CheckInstanceType>({receiver}, CheckType::kCheckHeapObject,
-                                    JS_DATA_VIEW_TYPE, JS_DATA_VIEW_TYPE));
+  if (!EnsureType(receiver, NodeType::kJSDataView)) {
+    RETURN_IF_ABORT(
+        AddNewNode<CheckInstanceType>({receiver}, CheckType::kCheckHeapObject,
+                                      JS_DATA_VIEW_TYPE, JS_DATA_VIEW_TYPE));
+  }
   // TODO(v8:11111): Optimize for JS_RAB_GSAB_DATA_VIEW_TYPE too.
   ValueNode* offset;
   if (args[0]) {
@@ -9772,13 +9801,45 @@ MaybeReduceResult MaglevGraphBuilder::TryBuildStoreDataView(
   } else {
     offset = GetInt32Constant(0);
   }
+  ValueNode* byte_length;
+  GET_VALUE_OR_ABORT(byte_length, BuildLoadJSDataViewByteLength(receiver));
+
   RETURN_IF_ABORT(AddNewNode<CheckJSDataViewBounds>(
-      {receiver, offset}, ExternalArrayType::kExternalFloat64Array));
+      {offset, byte_length}, ExternalArrayType::kExternalFloat64Array));
   ValueNode* value = getValue(args[1]);
   ValueNode* is_little_endian = args[2] ? args[2] : GetBooleanConstant(false);
   RETURN_IF_ABORT(
       AddNewNode<StoreNode>({receiver, offset, value, is_little_endian}, type));
   return GetRootConstant(RootIndex::kUndefinedValue);
+}
+
+MaybeReduceResult MaglevGraphBuilder::TryReduceDataViewPrototypeGetByteLength(
+    compiler::JSFunctionRef target, CallArguments& args) {
+  // We cannot check CanSpeculateCall here, since this is a getter.
+
+  if (!broker()->dependencies()->DependOnArrayBufferDetachingProtector()) {
+    // TODO(victorgomes): Add checks whether the array has been detached.
+    return {};
+  }
+  // TODO(victorgomes): Add data view to known types.
+  ValueNode* receiver = GetValueOrUndefined(args.receiver());
+
+  auto possible_receiver_maps =
+      known_node_aspects().TryGetPossibleMaps(receiver);
+  if (!possible_receiver_maps) {
+    FAIL(" to reduce DataView.get byteLength - unknown receiver map");
+  }
+
+  // Don't optimize if any of the known maps is something else than a DataView
+  // map.
+  for (compiler::MapRef map : *possible_receiver_maps) {
+    // TODO(v8:11111): Optimize for JS_RAB_GSAB_DATA_VIEW_TYPE too.
+    if (map.instance_type() != JS_DATA_VIEW_TYPE) {
+      return {};
+    }
+  }
+
+  return BuildLoadJSDataViewByteLength(receiver);
 }
 
 MaybeReduceResult MaglevGraphBuilder::TryReduceDataViewPrototypeGetInt8(
@@ -10274,7 +10335,7 @@ MaybeReduceResult MaglevGraphBuilder::TryReduceArrayPrototypePush(
 
     // Do the store
     if (IsDoubleElementsKind(kind)) {
-      return BuildStoreFixedDoubleArrayElement(writable_elements_array,
+      return BuildStoreFixedDoubleArrayElement(kind, writable_elements_array,
                                                old_array_length, value);
     } else {
       DCHECK(IsSmiElementsKind(kind) || IsObjectElementsKind(kind));
@@ -10409,7 +10470,7 @@ MaybeReduceResult MaglevGraphBuilder::TryReduceArrayPrototypePop(
     // Store new length.
     RETURN_IF_ABORT(AddNewNode<StoreTaggedFieldNoWriteBarrier>(
         {receiver, new_array_length_smi}, JSArray::kLengthOffset,
-        StoreTaggedMode::kDefault));
+        StoreTaggedMode::kDefault, broker()->length_string()));
 
     // Load the value and store the hole in it's place.
     ValueNode* value;
@@ -10417,7 +10478,7 @@ MaybeReduceResult MaglevGraphBuilder::TryReduceArrayPrototypePop(
       GET_VALUE_OR_ABORT(value, BuildLoadFixedDoubleArrayElement(
                                     writable_elements_array, new_array_length));
       RETURN_IF_ABORT(BuildStoreFixedDoubleArrayElement(
-          writable_elements_array, new_array_length,
+          kind, writable_elements_array, new_array_length,
           GetFloat64Constant(Float64::FromBits(kHoleNanInt64))));
     } else {
       DCHECK(IsSmiElementsKind(kind) || IsObjectElementsKind(kind));
@@ -10646,6 +10707,7 @@ MaybeReduceResult MaglevGraphBuilder::TryReduceNumberParseInt(
     case ValueRepresentation::kUint32:
     case ValueRepresentation::kInt32:
     case ValueRepresentation::kIntPtr:
+    case ValueRepresentation::kShiftedInt53:
       return arg;
     case ValueRepresentation::kTagged:
       switch (CheckTypes(arg, {NodeType::kSmi})) {
@@ -10676,6 +10738,9 @@ MaybeReduceResult MaglevGraphBuilder::TryReduceMathAbs(
     case ValueRepresentation::kIntPtr:
       // TODO(388844115): Rename IntPtr to make it clear it's non-negative.
       return arg;
+    case ValueRepresentation::kShiftedInt53:
+      // TODO(victorgomes): Optimize the shifted case.
+      return {};
     case ValueRepresentation::kInt32:
       if (!CanSpeculateCall()) return {};
       return AddNewNode<Int32AbsWithOverflow>({arg});
@@ -10686,7 +10751,7 @@ MaybeReduceResult MaglevGraphBuilder::TryReduceMathAbs(
           return AddNewNode<Int32AbsWithOverflow>({arg});
         case NodeType::kNumberOrOddball:
           return AddNewNode<Float64Abs>(
-              {GetHoleyFloat64ForToNumber(arg, NodeType::kNumberOrOddball)});
+              {GetFloat64ForToNumber(arg, NodeType::kNumberOrOddball)});
         // TODO(verwaest): Add support for ToNumberOrNumeric and deopt.
         default:
           break;
@@ -10720,6 +10785,7 @@ MaybeReduceResult MaglevGraphBuilder::DoTryReduceMathRound(
   auto arg_repr = arg->value_representation();
   if (arg_repr == ValueRepresentation::kInt32 ||
       arg_repr == ValueRepresentation::kUint32 ||
+      arg_repr == ValueRepresentation::kShiftedInt53 ||
       arg_repr == ValueRepresentation::kIntPtr) {
     return arg;
   }
@@ -10734,7 +10800,7 @@ MaybeReduceResult MaglevGraphBuilder::DoTryReduceMathRound(
   DCHECK_EQ(arg_repr, ValueRepresentation::kTagged);
   if (CheckType(arg, NodeType::kNumberOrOddball)) {
     return AddNewNode<Float64Round>(
-        {GetHoleyFloat64ForToNumber(arg, NodeType::kNumberOrOddball)}, kind);
+        {GetFloat64ForToNumber(arg, NodeType::kNumberOrOddball)}, kind);
   }
   if (!CanSpeculateCall()) return {};
   LazyDeoptFrameScope continuation_scope(this,
@@ -10742,12 +10808,87 @@ MaybeReduceResult MaglevGraphBuilder::DoTryReduceMathRound(
   ToNumberOrNumeric* conversion;
   GET_VALUE_OR_ABORT(conversion, AddNewNode<ToNumberOrNumeric>(
                                      {arg}, Object::Conversion::kToNumber));
+  // TODO(victorgomes): rely on automatic input conversion here rather than
+  // calling UncheckedNumberToFloat64 manually.
   ValueNode* float64_value;
-  GET_VALUE_OR_ABORT(
-      float64_value,
-      AddNewNode<UncheckedNumberOrOddballToFloat64>(
-          {conversion}, TaggedToFloat64ConversionType::kOnlyNumber));
+  GET_VALUE_OR_ABORT(float64_value,
+                     AddNewNode<UnsafeNumberToFloat64>({conversion}));
   return AddNewNode<Float64Round>({float64_value}, kind);
+}
+
+MaybeReduceResult MaglevGraphBuilder::TryReduceMathMin(
+    compiler::JSFunctionRef target, CallArguments& args) {
+  if (args.count() == 0) {
+    return GetConstant(broker()->infinity_value());
+  }
+  return TryReduceMathMinMax(
+      args,
+      [&](ValueNode* v1, ValueNode* v2) -> ValueNode* {
+        return BuildInt32Min(v1, v2);
+      },
+      [&](ValueNode* v1, ValueNode* v2) -> ReduceResult {
+        ValueNode* v1_float =
+            reducer_.GetFloat64ForToNumber(v1, NodeType::kNumberOrOddball);
+        ValueNode* v2_float =
+            reducer_.GetFloat64ForToNumber(v2, NodeType::kNumberOrOddball);
+        RETURN_IF_DONE(reducer_.TryFoldFloat64Min(v1_float, v2_float));
+        return AddNewNode<Float64Min>({v1_float, v2_float});
+      });
+}
+
+MaybeReduceResult MaglevGraphBuilder::TryReduceMathMax(
+    compiler::JSFunctionRef target, CallArguments& args) {
+  if (args.count() == 0) {
+    return GetConstant(broker()->minus_infinity_value());
+  }
+  return TryReduceMathMinMax(
+      args,
+      [&](ValueNode* v1, ValueNode* v2) -> ValueNode* {
+        return BuildInt32Max(v1, v2);
+      },
+      [&](ValueNode* v1, ValueNode* v2) -> ReduceResult {
+        ValueNode* v1_float =
+            reducer_.GetFloat64ForToNumber(v1, NodeType::kNumberOrOddball);
+        ValueNode* v2_float =
+            reducer_.GetFloat64ForToNumber(v2, NodeType::kNumberOrOddball);
+        RETURN_IF_DONE(reducer_.TryFoldFloat64Max(v1_float, v2_float));
+        return AddNewNode<Float64Max>({v1_float, v2_float});
+      });
+}
+
+template <typename Int32Binop, typename Float64Binop>
+MaybeReduceResult MaglevGraphBuilder::TryReduceMathMinMax(
+    CallArguments& args, Int32Binop&& int32_case, Float64Binop&& float64_case) {
+  bool all_args_are_int32_or_smi =
+      std::all_of(args.begin(), args.end(), [&](ValueNode* arg) {
+        return GetType(arg) == NodeType::kSmi ||
+               arg->properties().value_representation() ==
+                   ValueRepresentation::kInt32;
+      });
+
+  if (all_args_are_int32_or_smi) {
+    // TODO(C++23): Use std::ranges::fold_left_first.
+    // int32_case will convert the parameters to Int32.
+    return std::reduce(args.begin() + 1, args.end(), *args.begin(), int32_case);
+  }
+
+  // TODO(marja): Investigate whether a non-speculative Float64 case helps.
+  if (!CanSpeculateCall()) return {};
+
+  // float64_case will convert the parameters to Float64. Only the first one
+  // has to be converted explicitly.
+  return std::reduce(
+      args.begin() + 1, args.end(),
+      ReduceResult(
+          reducer_.GetFloat64ForToNumber(args[0], NodeType::kNumberOrOddball)
+              ->Unwrap()),
+      [&](ReduceResult lhs_result, ReduceResult rhs_result) -> ReduceResult {
+        ValueNode* lhs;
+        GET_VALUE_OR_ABORT(lhs, lhs_result);
+        ValueNode* rhs;
+        GET_VALUE_OR_ABORT(rhs, rhs_result);
+        return float64_case(lhs, rhs);
+      });
 }
 
 MaybeReduceResult MaglevGraphBuilder::TryReduceArrayConstructor(
@@ -10775,6 +10916,9 @@ MaybeReduceResult MaglevGraphBuilder::TryReduceMathClz32(
   if (arg_repr == ValueRepresentation::kFloat64 ||
       arg_repr == ValueRepresentation::kHoleyFloat64) {
     if (IsSupported(CpuOperation::kFloat64Round)) {
+      if (arg_repr == ValueRepresentation::kHoleyFloat64) {
+        arg = GetFloat64ForToNumber(arg, NodeType::kNumberOrOddball);
+      }
       return AddNewNode<Float64CountLeadingZeros>({arg});
     }
     return {};
@@ -10794,11 +10938,11 @@ MaybeReduceResult MaglevGraphBuilder::TryReduceMathClz32(
   ToNumberOrNumeric* conversion;
   GET_VALUE_OR_ABORT(conversion, AddNewNode<ToNumberOrNumeric>(
                                      {arg}, Object::Conversion::kToNumber));
+  // TODO(victorgomes): rely on automatic input conversion here rather than
+  // calling UnsafeNumberToFloat64 manually.
   ValueNode* float64_value;
-  GET_VALUE_OR_ABORT(
-      float64_value,
-      AddNewNode<UncheckedNumberOrOddballToFloat64>(
-          {conversion}, TaggedToFloat64ConversionType::kOnlyNumber));
+  GET_VALUE_OR_ABORT(float64_value,
+                     AddNewNode<UnsafeNumberToFloat64>({conversion}));
   return AddNewNode<Float64CountLeadingZeros>({float64_value});
 }
 
@@ -11166,9 +11310,7 @@ MaybeReduceResult MaglevGraphBuilder::TryBuildCallKnownJSFunction(
   } else {
     res = TryBuildCallKnownJSFunction(
         context_node, closure, new_target,
-#ifdef V8_ENABLE_LEAPTIERING
         function.dispatch_handle(),
-#endif
         shared, function.raw_feedback_cell(broker()), args, feedback_source);
   }
   return res;
@@ -11176,9 +11318,7 @@ MaybeReduceResult MaglevGraphBuilder::TryBuildCallKnownJSFunction(
 
 ReduceResult MaglevGraphBuilder::BuildCallKnownJSFunction(
     ValueNode* context, ValueNode* function, ValueNode* new_target,
-#ifdef V8_ENABLE_LEAPTIERING
     JSDispatchHandle dispatch_handle,
-#endif
     compiler::SharedFunctionInfoRef shared,
     compiler::FeedbackCellRef feedback_cell, CallArguments& args,
     const compiler::FeedbackSource& feedback_source) {
@@ -11193,18 +11333,14 @@ ReduceResult MaglevGraphBuilder::BuildCallKnownJSFunction(
         }
         return ReduceResult::Done();
       },
-#ifdef V8_ENABLE_LEAPTIERING
       dispatch_handle,
-#endif
       shared, GetTaggedValue(function), GetTaggedValue(context),
       GetTaggedValue(receiver), GetTaggedValue(new_target), feedback_source);
 }
 
 ReduceResult MaglevGraphBuilder::BuildCallKnownJSFunction(
     ValueNode* context, ValueNode* function, ValueNode* new_target,
-#ifdef V8_ENABLE_LEAPTIERING
     JSDispatchHandle dispatch_handle,
-#endif
     compiler::SharedFunctionInfoRef shared,
     base::Vector<ValueNode*> arguments) {
   DCHECK_GT(arguments.size(), 0);
@@ -11221,9 +11357,7 @@ ReduceResult MaglevGraphBuilder::BuildCallKnownJSFunction(
         }
         return ReduceResult::Done();
       },
-#ifdef V8_ENABLE_LEAPTIERING
       dispatch_handle,
-#endif
       shared, GetTaggedValue(function), GetTaggedValue(context),
       GetTaggedValue(arguments[0]), GetTaggedValue(new_target),
       compiler::FeedbackSource{});
@@ -11231,24 +11365,28 @@ ReduceResult MaglevGraphBuilder::BuildCallKnownJSFunction(
 
 MaybeReduceResult MaglevGraphBuilder::TryBuildCallKnownJSFunction(
     ValueNode* context, ValueNode* function, ValueNode* new_target,
-#ifdef V8_ENABLE_LEAPTIERING
     JSDispatchHandle dispatch_handle,
-#endif
     compiler::SharedFunctionInfoRef shared,
     compiler::FeedbackCellRef feedback_cell, CallArguments& args,
     const compiler::FeedbackSource& feedback_source) {
+  // Truncate args when they are unreachable.
+  if (args.mode() == CallArguments::kDefault &&
+      shared.object()->CanOnlyAccessFixedFormalParameters()) {
+    auto parameter_count =
+        IsolateGroup::current()->js_dispatch_table()->GetParameterCount(
+            dispatch_handle);
+    if (args.count() > parameter_count - kJSArgcReceiverSlots) {
+      args.ResizeDefaultArguments(parameter_count - kJSArgcReceiverSlots);
+    }
+  }
   if (v8_flags.maglev_inlining) {
     RETURN_IF_DONE(TryBuildInlineCall(context, function, new_target,
-#ifdef V8_ENABLE_LEAPTIERING
                                       dispatch_handle,
-#endif
                                       shared, feedback_cell, args,
                                       feedback_source));
   }
   return BuildCallKnownJSFunction(context, function, new_target,
-#ifdef V8_ENABLE_LEAPTIERING
                                   dispatch_handle,
-#endif
                                   shared, feedback_cell, args, feedback_source);
 }
 
@@ -11282,7 +11420,7 @@ ReduceResult MaglevGraphBuilder::BuildCheckNumericalValueOrByReference(
 
 ReduceResult MaglevGraphBuilder::BuildCheckInternalizedStringValueOrByReference(
     ValueNode* node, compiler::HeapObjectRef ref, DeoptimizeReason reason) {
-  if (!IsConstantNode(node->opcode()) && ref.IsInternalizedString()) {
+  if (!TryGetConstant(node) && ref.IsInternalizedString()) {
     if (!IsInstanceOfNodeType(ref.map(broker()), GetType(node), broker())) {
       return EmitUnconditionalDeopt(reason);
     }
@@ -11299,17 +11437,22 @@ ReduceResult MaglevGraphBuilder::BuildCheckNumericalValue(
   DCHECK(ref.IsSmi() || ref.IsHeapNumber());
   if (ref.IsSmi()) {
     int ref_value = ref.AsSmi();
-    if (IsConstantNode(node->opcode())) {
-      if (node->Is<SmiConstant>() &&
-          node->Cast<SmiConstant>()->value().value() == ref_value) {
+
+    if (std::optional<int32_t> cst = TryGetInt32Constant(node)) {
+      if (cst.value() == ref_value) {
         return ReduceResult::Done();
+      } else {
+        return EmitUnconditionalDeopt(reason);
       }
-      if (node->Is<Int32Constant>() &&
-          node->Cast<Int32Constant>()->value() == ref_value) {
-        return ReduceResult::Done();
-      }
+    }
+
+    if (TryGetFloat64OrHoleyFloat64Constant(
+            UseRepresentation::kFloat64, node,
+            TaggedToFloat64ConversionType::kOnlyNumber)) {
+      // This a non-smi float64 constant ==> deopting.
       return EmitUnconditionalDeopt(reason);
     }
+
     if (NodeTypeIs(GetType(node), NodeType::kAnyHeapObject)) {
       return EmitUnconditionalDeopt(reason);
     }
@@ -11319,25 +11462,23 @@ ReduceResult MaglevGraphBuilder::BuildCheckNumericalValue(
     DCHECK(ref.IsHeapNumber());
     Float64 ref_value = Float64::FromBits(ref.AsHeapNumber().value_as_bits());
     DCHECK(!ref_value.is_hole_nan());
-    if (node->Is<Float64Constant>()) {
-      Float64 f64 = node->Cast<Float64Constant>()->value();
-      DCHECK(!f64.is_hole_nan());
-      if (f64 == ref_value) {
+
+    if (std::optional<Float64> cst = TryGetFloat64OrHoleyFloat64Constant(
+            UseRepresentation::kFloat64, node,
+            TaggedToFloat64ConversionType::kOnlyNumber)) {
+      if (cst->is_nan() && ref_value.is_nan()) {
         return ReduceResult::Done();
       }
-      return EmitUnconditionalDeopt(reason);
-    } else if (compiler::OptionalHeapObjectRef constant =
-                   TryGetConstant(node)) {
-      if (constant.value().IsHeapNumber()) {
-        Float64 f64 =
-            Float64::FromBits(constant.value().AsHeapNumber().value_as_bits());
-        DCHECK(!f64.is_hole_nan());
-        if (f64 == ref_value) {
-          return ReduceResult::Done();
-        }
+      // For non-NaN values, we need to make sure to distinguish 0 and -0.
+      if (cst->get_scalar() == ref_value.get_scalar() &&
+          std::signbit(cst->get_scalar()) ==
+              std::signbit(ref_value.get_scalar())) {
+        return ReduceResult::Done();
       }
+
       return EmitUnconditionalDeopt(reason);
     }
+
     if (!NodeTypeIs(NodeType::kNumber, GetType(node))) {
       return EmitUnconditionalDeopt(reason);
     }
@@ -11466,9 +11607,7 @@ MaybeReduceResult MaglevGraphBuilder::TryReduceCallForTarget(
 
 MaybeReduceResult MaglevGraphBuilder::TryReduceCallForNewClosure(
     ValueNode* target_node, ValueNode* target_context,
-#ifdef V8_ENABLE_LEAPTIERING
     JSDispatchHandle dispatch_handle,
-#endif
     compiler::SharedFunctionInfoRef shared,
     compiler::FeedbackCellRef feedback_cell, CallArguments& args,
     const compiler::FeedbackSource& feedback_source) {
@@ -11486,9 +11625,7 @@ MaybeReduceResult MaglevGraphBuilder::TryReduceCallForNewClosure(
     RETURN_IF_DONE(TryBuildCallKnownJSFunction(
         target_context, target_node,
         GetRootConstant(RootIndex::kUndefinedValue),
-#ifdef V8_ENABLE_LEAPTIERING
         dispatch_handle,
-#endif
         shared, feedback_cell, args, feedback_source));
   }
   return BuildGenericCall(target_node, Call::TargetType::kJSFunction, args);
@@ -11601,9 +11738,7 @@ ReduceResult MaglevGraphBuilder::BuildCallWithFeedback(
             TryBuildCallKnownJSFunction(
                 context, target_node,
                 GetRootConstant(RootIndex::kUndefinedValue),
-#ifdef V8_ENABLE_LEAPTIERING
                 feedback_cell.dispatch_handle(),
-#endif
                 shared.value(), feedback_cell, args, feedback_source),
             SetAccumulator);
         UNREACHABLE();
@@ -11639,7 +11774,7 @@ ReduceResult MaglevGraphBuilder::ReduceCallWithArrayLikeForArgumentsObject(
       }
     }
     int start_index = 0;
-    if (elements_value->Cast<ArgumentsElements>()->type() ==
+    if (elements_value->Cast<ArgumentsElements>()->create_arguments_type() ==
         CreateArgumentsType::kRestParameter) {
       start_index =
           elements_value->Cast<ArgumentsElements>()->formal_parameter_count();
@@ -11772,9 +11907,7 @@ ReduceResult MaglevGraphBuilder::ReduceCall(
           target_node->TryCast<FastCreateClosure>()) {
     MaybeReduceResult result = TryReduceCallForNewClosure(
         fast_create_closure, fast_create_closure->context().node(),
-#ifdef V8_ENABLE_LEAPTIERING
         fast_create_closure->feedback_cell().dispatch_handle(),
-#endif
         fast_create_closure->shared_function_info(),
         fast_create_closure->feedback_cell(), args, feedback_source);
     RETURN_IF_DONE(result);
@@ -11782,9 +11915,7 @@ ReduceResult MaglevGraphBuilder::ReduceCall(
                  target_node->TryCast<CreateClosure>()) {
     MaybeReduceResult result = TryReduceCallForNewClosure(
         create_closure, create_closure->context().node(),
-#ifdef V8_ENABLE_LEAPTIERING
         create_closure->feedback_cell().dispatch_handle(),
-#endif
         create_closure->shared_function_info(), create_closure->feedback_cell(),
         args, feedback_source);
     RETURN_IF_DONE(result);
@@ -12219,37 +12350,59 @@ MaybeReduceResult MaglevGraphBuilder::TryBuildAndAllocateJSGeneratorObject(
 
 namespace {
 
+enum class InlineArrayCtorVariant {
+  kZeroArgs,
+  kOneArg_InterpretAsLength,
+  kOneArg_InterpretAsElementValue,
+  kMultipleArgs,
+};
+
 compiler::OptionalMapRef GetArrayConstructorInitialMap(
     compiler::JSHeapBroker* broker, compiler::JSFunctionRef array_function,
-    ElementsKind elements_kind, size_t argc, std::optional<int> maybe_length) {
+    ElementsKind* elements_kind, InlineArrayCtorVariant variant) {
   compiler::MapRef initial_map = array_function.initial_map(broker);
-  if (argc == 1 && (!maybe_length.has_value() || *maybe_length > 0)) {
+  if (variant == InlineArrayCtorVariant::kOneArg_InterpretAsLength) {
     // Constructing an Array via new Array(N) where N is an unsigned
     // integer, always creates a holey backing store.
-    elements_kind = GetHoleyElementsKind(elements_kind);
+    *elements_kind = GetHoleyElementsKind(*elements_kind);
   }
-  return initial_map.AsElementsKind(broker, elements_kind);
+  return initial_map.AsElementsKind(broker, *elements_kind);
 }
 
 }  // namespace
 
-ValueNode* MaglevGraphBuilder::BuildElementsArray(int length) {
+ValueNode* MaglevGraphBuilder::BuildElementsArray(ElementsKind elements_kind,
+                                                  int length) {
+  DCHECK_GE(length, 0);
+  DCHECK(IsFastElementsKind(elements_kind));
   if (length == 0) {
     return GetRootConstant(RootIndex::kEmptyFixedArray);
   }
-  base::SmallVector<ValueNode*, 16> values(
-      length, GetRootConstant(RootIndex::kTheHoleValue));
-  return CreateFixedArray(base::VectorOf(values));
+
+  // This DCHECK is slightly hacky since it relies on callers passing
+  // kPreallocatedArrayElements for length 0 arrays. The intent is to make sure
+  // that callers use a holey elements kind for the `Array(length)` 1-argument
+  // constructor.
+  DCHECK(IsHoleyElementsKind(elements_kind) ||
+         length == JSArray::kPreallocatedArrayElements);
+
+  ValueNode* the_hole_value;
+  if (IsDoubleElementsKind(elements_kind)) {
+    the_hole_value = GetFloat64Constant(Float64::hole_nan());
+  } else {
+    the_hole_value = GetRootConstant(RootIndex::kTheHoleValue);
+  }
+
+  base::SmallVector<ValueNode*, 16> values(length, the_hole_value);
+  return BuildElementsArray(elements_kind, base::VectorOf(values));
 }
 
 ValueNode* MaglevGraphBuilder::BuildElementsArray(
     ElementsKind elements_kind, base::Vector<ValueNode*> values) {
-  DCHECK_GT(static_cast<int>(values.size()), 1);
-  if (IsDoubleElementsKind(elements_kind)) {
-    UNIMPLEMENTED();
-  }
-
-  return CreateFixedArray(values);
+  DCHECK(IsFastElementsKind(elements_kind));
+  DCHECK_GT(static_cast<int>(values.size()), 0);
+  return IsDoubleElementsKind(elements_kind) ? CreateFixedDoubleArray(values)
+                                             : CreateFixedArray(values);
 }
 
 MaybeReduceResult MaglevGraphBuilder::TryReduceConstructArrayConstructor(
@@ -12259,60 +12412,76 @@ MaybeReduceResult MaglevGraphBuilder::TryReduceConstructArrayConstructor(
       maybe_allocation_site.has_value()
           ? maybe_allocation_site->GetElementsKind()
           : array_function.initial_map(broker()).elements_kind();
-  // TODO(victorgomes): Support double elements array.
-  if (IsDoubleElementsKind(elements_kind)) return {};
   DCHECK(IsFastElementsKind(elements_kind));
-
   const int arity = static_cast<int>(args.count());
+
+  InlineArrayCtorVariant variant;
+  if (arity == 0) {
+    variant = InlineArrayCtorVariant::kZeroArgs;
+  } else if (arity == 1) {
+    // TODO(jgruber): Also handle kOneArg_InterpretAsElementValue, for when the
+    // single argument is not a number. That case, once recognized, could be
+    // merged with kMultipleArgs.
+    variant = InlineArrayCtorVariant::kOneArg_InterpretAsLength;
+  } else {
+    variant = InlineArrayCtorVariant::kMultipleArgs;
+  }
+
   std::optional<int> maybe_length;
-  if (arity == 1) {
+  if (variant == InlineArrayCtorVariant::kOneArg_InterpretAsLength) {
     maybe_length = TryGetInt32Constant(args[0]);
+    if (maybe_length.has_value()) {
+      if (*maybe_length < 0) return {};
+      if (*maybe_length >= JSArray::kInitialMaxFastElementArray) return {};
+      static_assert(JSArray::kInitialMaxFastElementArray <
+                    JSArray::kMaxFastArrayLength);
+    }
   }
   compiler::OptionalMapRef maybe_initial_map = GetArrayConstructorInitialMap(
-      broker(), array_function, elements_kind, arity, maybe_length);
+      broker(), array_function, &elements_kind, variant);
   if (!maybe_initial_map.has_value()) return {};
   compiler::MapRef initial_map = maybe_initial_map.value();
   compiler::SlackTrackingPrediction slack_tracking_prediction =
       broker()->dependencies()->DependOnInitialMapInstanceSizePrediction(
           array_function);
 
-  // Tells whether we are protected by either the {site} or a
-  // call speculation bit to do certain speculative optimizations.
-  bool can_inline_call = false;
+  // Tells whether we are protected by either the {site} or a call speculation
+  // bit to do certain speculative optimizations. This mechanism protects
+  // against deopt loops.
+  bool can_speculate_call;
   AllocationType allocation_type = AllocationType::kYoung;
 
   if (maybe_allocation_site) {
-    can_inline_call = maybe_allocation_site->CanInlineCall();
+    can_speculate_call = !maybe_allocation_site->IsSpeculationDisabled();
     allocation_type =
         broker()->dependencies()->DependOnPretenureMode(*maybe_allocation_site);
     broker()->dependencies()->DependOnElementsKind(*maybe_allocation_site);
   } else {
-    can_inline_call = CanSpeculateCall();
+    can_speculate_call = CanSpeculateCall();
   }
 
   // Arity 0, `new Array()`.
-  if (arity == 0) {
+  if (variant == InlineArrayCtorVariant::kZeroArgs) {
     return BuildAndAllocateJSArray(
         initial_map, GetSmiConstant(0),
-        BuildElementsArray(JSArray::kPreallocatedArrayElements),
+        BuildElementsArray(elements_kind, JSArray::kPreallocatedArrayElements),
         slack_tracking_prediction, allocation_type);
   }
 
   // Arity 1, `new Array(maybe_length)`.
-  if (arity == 1) {
-    if (maybe_length.has_value() && *maybe_length >= 0 &&
-        *maybe_length < JSArray::kInitialMaxFastElementArray) {
-      return BuildAndAllocateJSArray(initial_map, GetSmiConstant(*maybe_length),
-                                     BuildElementsArray(*maybe_length),
-                                     slack_tracking_prediction,
-                                     allocation_type);
+  if (variant == InlineArrayCtorVariant::kOneArg_InterpretAsLength) {
+    if (maybe_length.has_value()) {
+      DCHECK_GE(*maybe_length, 0);
+      DCHECK_LT(*maybe_length, JSArray::kInitialMaxFastElementArray);
+      return BuildAndAllocateJSArray(
+          initial_map, GetSmiConstant(*maybe_length),
+          BuildElementsArray(elements_kind, *maybe_length),
+          slack_tracking_prediction, allocation_type);
     }
 
-    // TODO(victorgomes): If we know the argument cannot be a number, we should
-    // allocate an array with one element.
     // We don't know anything about the length, so we rely on the allocation
     // site to avoid deopt loops.
-    if (!can_inline_call) return {};
+    if (!can_speculate_call) return {};
 
     return SelectReduction(
         [&](BranchBuilder& builder) {
@@ -12322,8 +12491,9 @@ MaybeReduceResult MaglevGraphBuilder::TryReduceConstructArrayConstructor(
         },
         [&] {
           ValueNode* elements;
-          GET_VALUE_OR_ABORT(elements, AddNewNode<AllocateElementsArray>(
-                                           {args[0]}, allocation_type));
+          GET_VALUE_OR_ABORT(elements,
+                             AddNewNode<AllocateElementsArray>(
+                                 {args[0]}, elements_kind, allocation_type));
           return BuildAndAllocateJSArray(initial_map, args[0], elements,
                                          slack_tracking_prediction,
                                          allocation_type);
@@ -12339,43 +12509,44 @@ MaybeReduceResult MaglevGraphBuilder::TryReduceConstructArrayConstructor(
 
   // Arity > 1, `new Array(x0, x1, ...)`.
   DCHECK_GT(arity, 1);
+  DCHECK_EQ(variant, InlineArrayCtorVariant::kMultipleArgs);
 
   // Gather the values to store into the newly created array, and remember
   // sufficient information about node types so we can select a suitable
   // elements_kind below.
+  bool values_all_smis = true, values_all_numbers = true,
+       values_any_nonnumber = false;
   base::SmallVector<ValueNode*, 16> values;
   values.reserve(arity);
-  NodeType combined_type = NodeType::kNone;
-  bool any_value_has_unknown_type = false;
   for (ValueNode* v : args) {
     NodeType node_type = GetType(v);
-    if (NodeTypeIs(node_type, NodeType::kUnknown)) {
-      // No static type info available; this is tracked separately from static
-      // types, since we may still speculate on present static types from other
-      // value nodes below.
-      any_value_has_unknown_type = true;
-    } else {
-      combined_type = UnionType(combined_type, node_type);
+    if (!NodeTypeIs(node_type, NodeType::kSmi)) {
+      values_all_smis = false;
+      if (!NodeTypeIs(node_type, NodeType::kNumber)) {
+        values_all_numbers = false;
+        if (!NodeTypeCanBe(node_type, NodeType::kNumber)) {
+          values_any_nonnumber = true;
+        }
+      }
     }
     values.push_back(v);
   }
 
-  if (NodeTypeIs(combined_type, NodeType::kSmi)) {
+  if (values_all_smis) {
     // Smis can be stored with any elements kind.
-  } else if (NodeTypeIs(combined_type, NodeType::kNumber)) {
+  } else if (values_all_numbers) {
     elements_kind = GetMoreGeneralElementsKind(
         elements_kind, IsHoleyElementsKind(elements_kind)
                            ? HOLEY_DOUBLE_ELEMENTS
                            : PACKED_DOUBLE_ELEMENTS);
-  } else if (!NodeTypeCanBe(combined_type, NodeType::kNumber)) {
+  } else if (values_any_nonnumber) {
     // We statically know that at least one value is not a number.
     elements_kind = GetMoreGeneralElementsKind(
         elements_kind,
         IsHoleyElementsKind(elements_kind) ? HOLEY_ELEMENTS : PACKED_ELEMENTS);
-  }
-
-  if (IsDoubleElementsKind(elements_kind)) {
-    // TODO(jgruber): Implement.
+  } else if (!can_speculate_call) {
+    // We cannot precisely determine the elements_kind based on static types,
+    // and speculation has already been disabled via feedback.
     return {};
   }
 
@@ -12387,25 +12558,25 @@ MaybeReduceResult MaglevGraphBuilder::TryReduceConstructArrayConstructor(
     initial_map = maybe_updated_map.value();
   }
 
-  if (any_value_has_unknown_type && !IsObjectElementsKind(elements_kind)) {
-    if (!can_inline_call) return {};
-
-    // We speculate, ignoring values without static types wrt elements_kind
-    // selection and inserting Check nodes instead.
+  // Insert type checks as necessary.
+  if (IsSmiElementsKind(elements_kind)) {
     for (ValueNode* v : args) {
-      if (!NodeTypeIs(GetType(v), NodeType::kUnknown)) continue;
-      if (IsSmiElementsKind(elements_kind)) {
-        RETURN_IF_ABORT(BuildCheckSmi(v));
-      } else {
-        DCHECK(IsDoubleElementsKind(elements_kind));
-        RETURN_IF_ABORT(BuildCheckNumber(v));
-      }
+      if (NodeTypeIs(GetType(v), NodeType::kSmi)) continue;
+      RETURN_IF_ABORT(BuildCheckSmi(v));
+      // Note that BuildCheckSmi doesn't actually convert the value; it just
+      // checks that it *can* be canonicalized. The conversion happens later,
+      // see ConvertForField.
+    }
+  } else if (IsDoubleElementsKind(elements_kind)) {
+    for (ValueNode* v : args) {
+      if (NodeTypeIs(GetType(v), NodeType::kNumber)) continue;
+      RETURN_IF_ABORT(BuildCheckNumber(v));
     }
   }
 
   return BuildAndAllocateJSArray(
       initial_map, GetSmiConstant(arity),
-      BuildElementsArray(elements_kind, base::VectorOf(values.begin(), arity)),
+      BuildElementsArray(elements_kind, base::VectorOf(values)),
       slack_tracking_prediction, allocation_type);
 }
 
@@ -13000,6 +13171,9 @@ ReduceResult MaglevGraphBuilder::BuildToBoolean(ValueNode* value) {
     case ValueRepresentation::kInt32:
       return AddNewNodeNoInputConversion<Int32ToBoolean>({value}, flip);
 
+    case ValueRepresentation::kShiftedInt53:
+      return AddNewNodeNoInputConversion<ShiftedInt53ToBoolean>({value}, flip);
+
     case ValueRepresentation::kIntPtr:
       return AddNewNodeNoInputConversion<IntPtrToBoolean>({value}, flip);
 
@@ -13137,10 +13311,11 @@ ReduceResult MaglevGraphBuilder::BuildToNumberOrToNumeric(
     case ValueRepresentation::kUint32:
     case ValueRepresentation::kFloat64:
     case ValueRepresentation::kIntPtr:
+    case ValueRepresentation::kShiftedInt53:
       return ReduceResult::Done();
 
     case ValueRepresentation::kHoleyFloat64: {
-      return SetAccumulator(AddNewNode<HoleyFloat64ToMaybeNanFloat64>({value}));
+      return SetAccumulator(AddNewNode<HoleyFloat64ToSilencedFloat64>({value}));
     }
 
     case ValueRepresentation::kTagged:
@@ -13471,9 +13646,18 @@ MaglevGraphBuilder::TryReadBoilerplateForFastLiteral(
     if (boilerplate_elements.IsFixedDoubleArray()) {
       int const size = FixedDoubleArray::SizeFor(elements_length);
       if (size > kMaxRegularHeapObjectSize) return {};
-      fast_literal->set(
-          JSObject::kElementsOffset,
-          CreateFixedDoubleArray(boilerplate_elements.AsFixedDoubleArray()));
+
+      compiler::FixedDoubleArrayRef boilerplate_elements_as_fda =
+          boilerplate_elements.AsFixedDoubleArray();
+      base::SmallVector<ValueNode*, 16> values;
+      values.reserve(elements_length);
+      for (uint32_t i = 0; i < elements_length; i++) {
+        values.push_back(GetFloat64Constant(
+            boilerplate_elements_as_fda.GetFromImmutableFixedDoubleArray(i)));
+      }
+
+      fast_literal->set(JSObject::kElementsOffset,
+                        CreateFixedDoubleArray(base::VectorOf(values)));
     } else {
       int const size = FixedArray::SizeFor(elements_length);
       if (size > kMaxRegularHeapObjectSize) return {};
@@ -13529,26 +13713,6 @@ VirtualObject* MaglevGraphBuilder::CreateHeapNumber(ValueNode* value) {
   return vobj;
 }
 
-VirtualObject* MaglevGraphBuilder::CreateFixedDoubleArray(
-    const compiler::FixedDoubleArrayRef& elements) {
-  using Shape = VirtualFixedDoubleArrayShape;
-  uint32_t length = elements.length();
-  SBXCHECK_GT(length, 0);
-  int slot_count = Shape::header_slot_count + length;
-  compiler::MapRef map = broker()->fixed_double_array_map();
-  VirtualObject* vobj = NodeBase::New<VirtualObject>(
-      zone(), 0, NewObjectId(), this, &Shape::kObjectLayout, map, slot_count);
-  DCHECK_EQ(Shape::header_slot_count, 2);
-  vobj->set(HeapObject::kMapOffset, GetConstant(map));
-  vobj->set(FixedArrayBase::kLengthOffset, GetInt32Constant(length));
-  for (uint32_t i = 0; i < length; i++) {
-    static_assert(Shape::kElementsAreFloat64Constant);
-    vobj->set(FixedDoubleArray::OffsetOfElementAt(i),
-              GetFloat64Constant(elements.GetFromImmutableFixedDoubleArray(i)));
-  }
-  return vobj;
-}
-
 VirtualObject* MaglevGraphBuilder::CreateConsString(ValueNode* map,
                                                     ValueNode* length,
                                                     ValueNode* first,
@@ -13596,6 +13760,8 @@ ReduceResult MaglevGraphBuilder::CreateJSArray(compiler::MapRef map,
             GetRootConstant(RootIndex::kEmptyFixedArray));
   // Either the value is a Smi already, or we force a conversion to Smi and
   // cache the value in its alternative representation node.
+  // TODO(454485895): Consider removing this workaround since
+  // HoleyFloat64ToTagged now canonicalizes by default.
   RETURN_IF_ABORT(GetSmiValue(length));
   vobj->set(JSArray::kElementsOffset,
             GetRootConstant(RootIndex::kEmptyFixedArray));
@@ -13684,6 +13850,29 @@ VirtualObject* MaglevGraphBuilder::CreateFixedArray(
     vobj->set(FixedArray::OffsetOfElementAt(i), values[i]);
   }
 
+  return vobj;
+}
+
+VirtualObject* MaglevGraphBuilder::CreateFixedDoubleArray(
+    base::Vector<ValueNode* const> values) {
+  compiler::MapRef map = broker()->fixed_double_array_map();
+
+  using T = FixedDoubleArray;
+  using Shape = VirtualFixedDoubleArrayShape;
+  uint32_t length = values.length();
+  DCHECK_NE(length, 0);  // Use kEmptyFixedArray instead.
+
+  int slot_count = Shape::header_slot_count + length;
+  VirtualObject* vobj = NodeBase::New<VirtualObject>(
+      zone(), 0, NewObjectId(), this, &Shape::kObjectLayout, map, slot_count);
+  DCHECK_EQ(vobj->size(), T::SizeFor(length));
+
+  DCHECK_EQ(Shape::header_slot_count, 2);
+  vobj->set(HeapObject::kMapOffset, GetConstant(map));
+  vobj->set(FixedArrayBase::kLengthOffset, GetInt32Constant(length));
+  for (uint32_t i = 0; i < length; i++) {
+    vobj->set(T::OffsetOfElementAt(i), values[i]);
+  }
   return vobj;
 }
 
@@ -15025,8 +15214,10 @@ MaglevGraphBuilder::BranchResult MaglevGraphBuilder::BuildBranchIfToBooleanTrue(
     // The ToBoolean of both the_hole and NaN is false, so we can use the
     // same operation for HoleyFloat64 and Float64.
     case ValueRepresentation::kFloat64:
-    case ValueRepresentation::kHoleyFloat64:
       return BuildBranchIfFloat64ToBooleanTrue(builder, node);
+
+    case ValueRepresentation::kHoleyFloat64:
+      return BuildBranchIfHoleyFloat64ToBooleanTrue(builder, node);
 
     case ValueRepresentation::kUint32:
       // Uint32 has the same logic as Int32 when converting ToBoolean, namely
@@ -15038,6 +15229,9 @@ MaglevGraphBuilder::BranchResult MaglevGraphBuilder::BuildBranchIfToBooleanTrue(
 
     case ValueRepresentation::kIntPtr:
       return BuildBranchIfIntPtrToBooleanTrue(builder, node);
+
+    case ValueRepresentation::kShiftedInt53:
+      UNIMPLEMENTED();
 
     case ValueRepresentation::kTagged:
       break;
@@ -15052,6 +15246,10 @@ MaglevGraphBuilder::BranchResult MaglevGraphBuilder::BuildBranchIfToBooleanTrue(
     }
     if (ValueNode* as_float64 = node_info->alternative().float64()) {
       return BuildBranchIfFloat64ToBooleanTrue(builder, as_float64);
+    }
+    if (ValueNode* as_holey_float64 =
+            node_info->alternative().holey_float64()) {
+      return BuildBranchIfHoleyFloat64ToBooleanTrue(builder, as_holey_float64);
     }
   }
 
@@ -15091,6 +15289,13 @@ MaglevGraphBuilder::BuildBranchIfFloat64ToBooleanTrue(BranchBuilder& builder,
                                                       ValueNode* node) {
   // TODO(victorgomes): Optimize.
   return builder.Build<BranchIfFloat64ToBooleanTrue>({node});
+}
+
+MaglevGraphBuilder::BranchResult
+MaglevGraphBuilder::BuildBranchIfHoleyFloat64ToBooleanTrue(
+    BranchBuilder& builder, ValueNode* node) {
+  // TODO(victorgomes): Optimize.
+  return builder.Build<BranchIfHoleyFloat64ToBooleanTrue>({node});
 }
 
 MaglevGraphBuilder::BranchResult MaglevGraphBuilder::BuildBranchIfFloat64IsHole(
@@ -15475,6 +15680,7 @@ ReduceResult MaglevGraphBuilder::VisitThrowReferenceErrorIfHole() {
     case ValueRepresentation::kFloat64:
     case ValueRepresentation::kHoleyFloat64:
     case ValueRepresentation::kIntPtr:
+    case ValueRepresentation::kShiftedInt53:
       // Can't be the hole.
       // Note that HoleyFloat64 when converted to Tagged becomes Undefined
       // rather than the_hole, hence the early return for HoleyFloat64.
@@ -15770,7 +15976,7 @@ ReduceResult MaglevGraphBuilder::VisitForOfNext() {
   auto register_pair = iterator_.GetRegisterPairOperand(2);
 
   CallBuiltin* result_struct =
-      BuildCallBuiltin<Builtin::kForOfNextBaseline>({iterator, next_method});
+      BuildCallBuiltin<Builtin::kForOfNext>({iterator, next_method});
 
   StoreRegisterPair(register_pair, result_struct);
 
@@ -16394,9 +16600,8 @@ ValueNode* MaglevGraphBuilder::GetFloat64ForToNumber(
                                allowed_input_type);
 }
 
-ValueNode* MaglevGraphBuilder::GetHoleyFloat64ForToNumber(
-    ValueNode* value, NodeType allowed_input_type) {
-  return reducer_.GetHoleyFloat64ForToNumber(value, allowed_input_type);
+ValueNode* MaglevGraphBuilder::GetHoleyFloat64(ValueNode* value) {
+  return reducer_.GetHoleyFloat64(value);
 }
 
 compiler::OptionalHeapObjectRef MaglevGraphBuilder::TryGetConstant(
@@ -16411,9 +16616,11 @@ std::optional<uint32_t> MaglevGraphBuilder::TryGetUint32Constant(
     ValueNode* value) {
   return reducer_.TryGetUint32Constant(value);
 }
-std::optional<double> MaglevGraphBuilder::TryGetFloat64Constant(
-    ValueNode* value, TaggedToFloat64ConversionType conversion_type) {
-  return reducer_.TryGetFloat64Constant(value, conversion_type);
+std::optional<Float64> MaglevGraphBuilder::TryGetFloat64OrHoleyFloat64Constant(
+    UseRepresentation use_repr, ValueNode* value,
+    TaggedToFloat64ConversionType conversion_type) {
+  return reducer_.TryGetFloat64OrHoleyFloat64Constant(use_repr, value,
+                                                      conversion_type);
 }
 
 MaybeHandle<String> MaglevGraphBuilder::TryGetStringConstant(ValueNode* value) {
@@ -16552,7 +16759,7 @@ ReduceResult MaglevGraphBuilder::GetSilencedNaN(ValueNode* value) {
 
   // We only need to check for silenced NaN in non-conversion nodes or
   // conversion from tagged, since they can't be signalling NaNs.
-  if (value->properties().is_conversion()) {
+  if (value->is_conversion()) {
     // A conversion node should have at least one input.
     DCHECK_GE(value->input_count(), 1);
     // If the conversion node is tagged, we could be reading a fabricated sNaN
@@ -16571,7 +16778,7 @@ ReduceResult MaglevGraphBuilder::GetSilencedNaN(ValueNode* value) {
   }
 
   // Silence all other values.
-  return AddNewNode<HoleyFloat64ToMaybeNanFloat64>({value});
+  return AddNewNode<Float64ToSilencedFloat64>({value});
 }
 
 ValueNode* MaglevGraphBuilder::GetSecondValue(ValueNode* result) {
@@ -16765,14 +16972,19 @@ ReduceResult MaglevGraphBuilder::BuildLoadMap(ValueNode* object) {
   return BuildLoadTaggedField(object, HeapObject::kMapOffset);
 }
 
-template <typename Instruction, typename... Args>
 ReduceResult MaglevGraphBuilder::BuildLoadTaggedField(ValueNode* object,
                                                       uint32_t offset,
                                                       LoadType type,
-                                                      Args&&... args) {
-  if (!CanTrackObjectChanges(object, TrackObjectMode::kLoad)) {
-    return AddNewNode<Instruction>({object}, offset,
-                                   std::forward<Args>(args)..., type);
+                                                      bool is_const,
+                                                      PropertyKey key) {
+  // TODO(jgruber): The VirtualObject now stores map slots, so theoretically we
+  // could let the path below handle map loads as well. But, maglev currently
+  // doesn't like this at all - doing so creates problems like OOB vobject field
+  // loads, and missed JSArray elements kind transitions. We should understand
+  // whether this is an issue with --maglev-object-tracking.
+  if (offset == HeapObject::kMapOffset ||
+      !CanTrackObjectChanges(object, TrackObjectMode::kLoad)) {
+    return AddNewNode<LoadTaggedField>({object}, offset, type, is_const, key);
   }
 
   VirtualObject* vobject =

@@ -625,6 +625,8 @@ class Simulator : public SimulatorBase {
   // below (bad_ra, end_sim_pc).
   bool has_bad_pc() const;
 
+  int64_t SSMismatchCount() { return ss_mismatch_count_; }
+
  private:
   enum special_values {
     // Known bad pc value to ensure that the simulator does not execute
@@ -1189,6 +1191,13 @@ class Simulator : public SimulatorBase {
   // Floating-point control and status register.
   uint32_t FCSR_;
 
+  base::Vector<uintptr_t> shadow_stack_ =
+      base::Vector<uintptr_t>::New(kInitialShadowStackSize);
+  size_t csr_ssp_ = shadow_stack_.size();  // Shadow stack pointer
+  void PushShadowStack(uintptr_t value);
+  uintptr_t PopShadowStack(uintptr_t value);
+  int64_t ss_mismatch_count_ = 0;
+
 #ifdef CAN_USE_RVV_INSTRUCTIONS
   // RVV registers
   VRegisterValue Vregister_[kNumVRegisters];
@@ -1287,6 +1296,18 @@ class Simulator : public SimulatorBase {
 
   class GlobalMonitor {
    public:
+    class SimulatorMutex final {
+     public:
+      explicit SimulatorMutex(GlobalMonitor* global_monitor) {
+        if (!global_monitor->IsSingleThreaded()) {
+          guard.emplace(global_monitor->mutex_);
+        }
+      }
+
+     private:
+      std::optional<base::MutexGuard> guard;
+    };
+
     class LinkedAddress {
      public:
       LinkedAddress();
@@ -1313,32 +1334,32 @@ class Simulator : public SimulatorBase {
       int failure_counter_;
     };
 
-    // Exposed so it can be accessed by Simulator::{Read,Write}Ex*.
-    base::Mutex mutex;
-
     void NotifyLoadLinked_Locked(uintptr_t addr, LinkedAddress* linked_address);
     void NotifyStore_Locked(LinkedAddress* linked_address);
     bool NotifyStoreConditional_Locked(uintptr_t addr,
                                        LinkedAddress* linked_address);
 
+    // Called when the simulator is constructed.
+    void PrependLinkedAddress(LinkedAddress* linked_address);
     // Called when the simulator is destroyed.
     void RemoveLinkedAddress(LinkedAddress* linked_address);
 
     static GlobalMonitor* Get();
 
    private:
+    bool IsSingleThreaded() const { return num_linked_address_ == 1; }
     // Private constructor. Call {GlobalMonitor::Get()} to get the singleton.
     GlobalMonitor() = default;
     friend class base::LeakyObject<GlobalMonitor>;
 
-    bool IsProcessorInLinkedList_Locked(LinkedAddress* linked_address) const;
-    void PrependProcessor_Locked(LinkedAddress* linked_address);
-
     LinkedAddress* head_ = nullptr;
+    std::atomic<uint32_t> num_linked_address_ = 0;
+    base::Mutex mutex_;
   };
 
   LocalMonitor local_monitor_;
   GlobalMonitor::LinkedAddress global_monitor_thread_;
+  GlobalMonitor* global_monitor_;
 };
 }  // namespace internal
 }  // namespace v8

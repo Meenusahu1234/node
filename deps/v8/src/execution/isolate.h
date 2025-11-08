@@ -75,6 +75,10 @@ class SimulatorData;
 }  // namespace v8
 #endif
 
+#ifdef V8_DUMPLING
+#include "src/dumpling/dumpling-manager.h"
+#endif
+
 namespace v8_inspector {
 class V8Inspector;
 }  // namespace v8_inspector
@@ -490,7 +494,8 @@ using DebugObjectCache = std::vector<Handle<HeapObject>>;
 #define ISOLATE_INIT_LIST(V)                                                \
   /* Assembler state. */                                                    \
   V(FatalErrorCallback, exception_behavior, nullptr)                        \
-  V(OOMErrorCallback, oom_behavior, nullptr)                                \
+  V(OOMErrorCallbackWithData, oom_behavior, nullptr)                        \
+  V(void*, oom_callback_data, nullptr)                                      \
   V(LogEventCallback, event_logger, nullptr)                                \
   V(ModifyCodeGenerationFromStringsCallback2, modify_code_gen_callback,     \
     nullptr)                                                                \
@@ -1263,7 +1268,6 @@ class V8_EXPORT_PRIVATE Isolate final : private HiddenFactory {
 
   Address* builtin_entry_table() { return isolate_data_.builtin_entry_table(); }
 
-#ifdef V8_ENABLE_LEAPTIERING
   V8_INLINE JSDispatchHandle
   builtin_dispatch_handle(JSBuiltinDispatchHandleRoot::Idx idx) {
 #if V8_STATIC_DISPATCH_HANDLES_BOOL
@@ -1282,7 +1286,6 @@ class V8_EXPORT_PRIVATE Isolate final : private HiddenFactory {
     return heap()->js_dispatch_table_space();
   }
 
-#endif
   V8_INLINE Address* builtin_table() { return isolate_data_.builtin_table(); }
   V8_INLINE Address* builtin_tier0_table() {
     return isolate_data_.builtin_tier0_table();
@@ -1541,8 +1544,6 @@ class V8_EXPORT_PRIVATE Isolate final : private HiddenFactory {
   bool NeedsSourcePositions() const;
 
   bool IsLoggingCodeCreation() const;
-
-  inline bool InFastCCall() const;
 
   bool AllowsCodeCompaction() const;
 
@@ -1891,6 +1892,10 @@ class V8_EXPORT_PRIVATE Isolate final : private HiddenFactory {
     return builtins_constants_table_builder_;
   }
 
+#ifdef V8_DUMPLING
+  DumplingManager* dumpling_manager() { return &dumpling_manager_; }
+#endif
+
   // Hashes bits of the Isolate that are relevant for embedded builtins. In
   // particular, the embedded blob requires builtin InstructionStream object
   // layout and the builtins constants table to remain unchanged from
@@ -2026,6 +2031,16 @@ class V8_EXPORT_PRIVATE Isolate final : private HiddenFactory {
       add_crash_key_callback_(id, value);
     }
   }
+
+  v8::CrashKey AddCrashKeyString(const char key[], CrashKeySize size,
+                                 std::string_view value);
+  void SetCrashKeyString(CrashKey crash_key, std::string_view value);
+
+  void SetCrashKeyStringCallbacks(
+      AllocateCrashKeyStringCallback allocate_callback,
+      SetCrashKeyStringCallback set_callback);
+
+  bool HasCrashKeyStringCallbacks();
 
 #if defined(V8_ENABLE_ETW_STACK_WALKING)
   // Specifies the callback called when an ETW tracing session starts.
@@ -2412,7 +2427,8 @@ class V8_EXPORT_PRIVATE Isolate final : private HiddenFactory {
       heap()->FinalizeIncrementalMarkingAtomicallyIfRunning(
           i::GarbageCollectionReason::kFrozen);
       heap()->EnsureSweepingCompleted(
-          Heap::SweepingForcedFinalizationMode::kUnifiedHeap);
+          Heap::SweepingForcedFinalizationMode::kUnifiedHeap,
+          CompleteSweepingReason::kFreeze);
     }
   }
 
@@ -2909,6 +2925,9 @@ class V8_EXPORT_PRIVATE Isolate final : private HiddenFactory {
   // in case of a crash.
   AddCrashKeyCallback add_crash_key_callback_ = nullptr;
 
+  AllocateCrashKeyStringCallback allocate_crash_key_string_callback_;
+  SetCrashKeyStringCallback set_crash_key_string_callback_;
+
 #ifdef V8_ENABLE_WASM_SIMD256_REVEC
   compiler::turboshaft::WasmRevecVerifier* wasm_revec_verifier_for_test_ =
       nullptr;
@@ -2917,6 +2936,10 @@ class V8_EXPORT_PRIVATE Isolate final : private HiddenFactory {
   // Delete new/delete operators to ensure that Isolate::New() and
   // Isolate::Delete() are used for Isolate creation and deletion.
   void* operator new(size_t, void* ptr) { return ptr; }
+
+#ifdef V8_DUMPLING
+  DumplingManager dumpling_manager_;
+#endif
 
 #if USE_SIMULATOR
   SimulatorData* simulator_data_ = nullptr;
